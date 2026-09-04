@@ -12,6 +12,10 @@ on:
       tag:
         description: 'Release tag to upload to'
         default: 'proof'
+      torrent_url:
+        description: 'Direct .torrent URL if available'
+        required: false
+        default: ''
 
 permissions:
   contents: write
@@ -29,7 +33,18 @@ jobs:
           mkdir -p /tmp/dl
           cd /tmp/dl
           echo "Starting aria2 download for ${{ inputs.name }}..."
-          aria2c --seed-time=0 --max-connection-per-server=16 --split=16 --bt-stop-timeout=300 --summary-interval=5 "${{ inputs.magnet }}"
+          TORRENT_URL="${{ inputs.torrent_url }}"
+          if [ -n "$TORRENT_URL" ]; then
+            echo "Attempting direct .torrent fetch from $TORRENT_URL..."
+            aria2c --seed-time=0 --max-connection-per-server=16 --split=16 --bt-stop-timeout=120 --summary-interval=5 "$TORRENT_URL" || true
+          fi
+          
+          # If file not downloaded yet, fallback to magnet
+          if [ -z "$(ls -A /tmp/dl 2>/dev/null)" ]; then
+            echo "Downloading via magnet URI..."
+            aria2c --seed-time=0 --max-connection-per-server=16 --split=16 --bt-stop-timeout=300 --summary-interval=5 "${{ inputs.magnet }}"
+          fi
+          
           echo "Downloaded files:"
           ls -lh /tmp/dl
 
@@ -39,7 +54,7 @@ jobs:
         run: |
           TAG="${{ inputs.tag }}"
           REPO="Aditya-233/Torrenty"
-          gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1 || gh release create "$TAG" --repo "$REPO" --title "Torrent Cloud Downloads" --notes "Automated cloud torrent downloads for bypass users"
+          gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1 || gh release create "$TAG" --repo "$REPO" --title "Torrent Cloud Downloads" --notes "Automated cloud torrent downloads for bypass users" || true
           cd /tmp/dl
           for f in *; do
             if [ -f "$f" ]; then
@@ -48,6 +63,11 @@ jobs:
                 mv "$f" "$clean_name"
               fi
               echo "Uploading $clean_name..."
+              gh release upload "$TAG" "$clean_name" --repo "$REPO" --clobber
+            elif [ -d "$f" ]; then
+              clean_name="$(echo "$f" | sed 's/[][()]/_/g' | tr ' ' '_').tar"
+              tar -cf "$clean_name" "$f"
+              echo "Uploading directory archive $clean_name..."
               gh release upload "$TAG" "$clean_name" --repo "$REPO" --clobber
             fi
           done

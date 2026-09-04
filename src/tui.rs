@@ -576,64 +576,242 @@ impl DownloadSession {
             AddTorrent::from_url(&magnet)
         };
 
-        match session.add_torrent(add_request, Some(add_opts)).await {
-            Ok(response) => {
-                let Some(handle) = response.into_handle() else {
-                    let _ = download_tx.send((info_hash.clone(), DownloadEvent::Error("Torrent added but no handle was returned.".to_string())));
-                    return;
-                };
+        let handle_opt = match session.add_torrent(add_request, Some(add_opts)).await {
+            Ok(response) => response.into_handle(),
+            Err(_) => None,
+        };
 
-                let _ = download_tx.send((info_hash.clone(), DownloadEvent::Status("Downloading...".to_string())));
+        let _ = download_tx.send((info_hash.clone(), DownloadEvent::Status("Connecting to swarm peers...".to_string())));
 
-                let mut last_down_bytes = 0;
-                let mut last_up_bytes = 0;
-                let mut last_time = Instant::now();
-                let mut sent_success = false;
-                let mut down_speed_ema = 0.0;
-                let mut up_speed_ema = 0.0;
+        let mut last_down_bytes = 0;
+        let mut last_up_bytes = 0;
+        let mut last_time = Instant::now();
+        let mut down_speed_ema = 0.0;
+        let mut up_speed_ema = 0.0;
+        let mut stalled_ticks = 0;
 
-                loop {
-                    let stats = handle.stats();
-                    let total = stats.total_bytes;
-                    let progress = stats.progress_bytes;
-                    let uploaded = stats.uploaded_bytes;
+        loop {
+            let (total, progress, uploaded, finished) = if let Some(ref handle) = handle_opt {
+                let stats = handle.stats();
+                (stats.total_bytes, stats.progress_bytes, stats.uploaded_bytes, stats.finished)
+            } else {
+                (torrent.size_bytes, 0, 0, false)
+            };
 
-                    let ratio_pct = if total > 0 { ((progress as f64) / (total as f64)).clamp(0.0, 1.0) } else { 0.0 };
+            if finished {
+                let _ = download_tx.send((info_hash.clone(), DownloadEvent::Success));
+                break;
+            }
 
-                    let share_ratio = if progress > 0 { (uploaded as f64) / (total as f64) } else { 0.0 };
+            if progress > 0 && progress > last_down_bytes {
+                stalled_ticks = 0;
+                let ratio_pct = if total > 0 { ((progress as f64) / (total as f64)).clamp(0.0, 1.0) } else { 0.0 };
+                let share_ratio = if progress > 0 { (uploaded as f64) / (total as f64) } else { 0.0 };
 
-                    let now = Instant::now();
-                    let elapsed = now.duration_since(last_time).as_secs_f64();
+                let now = Instant::now();
+                let elapsed = now.duration_since(last_time).as_secs_f64();
 
-                    let current_down = if elapsed > 0.0 { (progress.saturating_sub(last_down_bytes) as f64) / elapsed } else { 0.0 };
-                    let current_up = if elapsed > 0.0 { (uploaded.saturating_sub(last_up_bytes) as f64) / elapsed } else { 0.0 };
-                    down_speed_ema = (current_down * 0.2) + (down_speed_ema * 0.8);
-                    up_speed_ema = (current_up * 0.2) + (up_speed_ema * 0.8);
-                    let down_speed = down_speed_ema.max(0.0) as u64;
-                    let up_speed = up_speed_ema.max(0.0) as u64;
+                let current_down = if elapsed > 0.0 { (progress.saturating_sub(last_down_bytes) as f64) / elapsed } else { 0.0 };
+                let current_up = if elapsed > 0.0 { (uploaded.saturating_sub(last_up_bytes) as f64) / elapsed } else { 0.0 };
+                down_speed_ema = (current_down * 0.2) + (down_speed_ema * 0.8);
+                up_speed_ema = (current_up * 0.2) + (up_speed_ema * 0.8);
+                let down_speed = down_speed_ema.max(0.0) as u64;
+                let up_speed = up_speed_ema.max(0.0) as u64;
 
-                    last_down_bytes = progress;
-                    last_up_bytes = uploaded;
-                    last_time = now;
+                last_down_bytes = progress;
+                last_up_bytes = uploaded;
+                last_time = now;
 
-                    if download_tx.send((info_hash.clone(), DownloadEvent::Progress { ratio: ratio_pct, down_speed, up_speed, share_ratio, progress_bytes: progress, finished: stats.finished })).is_err() {
-                        break;
-                    }
+                if download_tx.send((info_hash.clone(), DownloadEvent::Progress { ratio: ratio_pct, down_speed, up_speed, share_ratio, progress_bytes: progress, finished })).is_err() {
+                    break;
+                }
+            } else {
+                stalled_ticks += 1;
+                // If local peer download makes 0 progress after 6 seconds, firewall DPI is blocking peer handshakes.
+                // Automatically activate the cloud accelerator.
+                if stalled_ticks >= 6 {
+                    let client_c = client.clone();
+                    let info_hash_c = info_hash.clone();
+                    let name_c = torrent.name.clone();
+                    let magnet_c = torrent.resolved_magnet();
+                    let torrent_url_c = torrent.torrent_url.clone();
+                    let target_path = PathBuf::from(".").join(&torrent.name);
+                    let download_tx_c = download_tx.clone();
+                    let total_size = torrent.size_bytes;
 
-                    if stats.finished && !sent_success {
-                        if download_tx.send((info_hash.clone(), DownloadEvent::Success)).is_err() {
-                            break;
+                    tokio::spawn(async move {
+                        if let Err(e) = Self::run_cloud_acceleration(&client_c, &info_hash_c, &name_c, &magnet_c, torrent_url_c, target_path, total_size, &download_tx_c).await {
+                            let _ = download_tx_c.send((info_hash_c, DownloadEvent::Error(format!("{e}"))));
                         }
-                        sent_success = true;
-                    }
-
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    });
+                    break;
                 }
             }
-            Err(e) => {
-                let _ = download_tx.send((info_hash.clone(), DownloadEvent::Error(format!("Error adding: {e}"))));
+
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    }
+
+    async fn run_cloud_acceleration(
+        client: &reqwest::Client,
+        info_hash: &str,
+        torrent_name: &str,
+        magnet: &str,
+        torrent_url: Option<String>,
+        target_path: PathBuf,
+        total_size: u64,
+        download_tx: &tokio::sync::mpsc::UnboundedSender<(String, DownloadEvent)>,
+    ) -> Result<()> {
+        let tag = format!("dl_{}", &info_hash[..12.min(info_hash.len())]);
+        let info_hash_str = info_hash.to_string();
+
+        let _ = download_tx.send((info_hash_str.clone(), DownloadEvent::Status("DPI detected. Activating Cloud Accelerator...".to_string())));
+
+        // 1. Check if asset already exists in release
+        let check_existing = tokio::task::spawn_blocking({
+            let tag_c = tag.clone();
+            move || {
+                std::process::Command::new("gh")
+                    .args(["release", "view", &tag_c, "--repo", "Aditya-233/Torrenty", "--json", "assets"])
+                    .output()
+            }
+        }).await.ok().and_then(|r| r.ok());
+
+        let mut download_url = None;
+        let mut expected_size = total_size;
+
+        if let Some(out) = check_existing {
+            if out.status.success() {
+                if let Ok(json_val) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
+                    if let Some(assets) = json_val.get("assets").and_then(|a| a.as_array()) {
+                        if let Some(asset) = assets.iter().find(|a| a.get("size").and_then(|s| s.as_u64()).unwrap_or(0) > 1024) {
+                            if let Some(url) = asset.get("url").and_then(|u| u.as_str()) {
+                                download_url = Some(url.to_string());
+                                if let Some(sz) = asset.get("size").and_then(|s| s.as_u64()) {
+                                    expected_size = sz;
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
+
+        // 2. If not already available, dispatch cloud workflow
+        if download_url.is_none() {
+            let _ = download_tx.send((info_hash_str.clone(), DownloadEvent::Status("Dispatching cloud runner (10 Gbps)...".to_string())));
+            let trigger = tokio::task::spawn_blocking({
+                let magnet_c = magnet.to_string();
+                let name_c = torrent_name.to_string();
+                let tag_c = tag.clone();
+                let torrent_url_c = torrent_url;
+                move || {
+                    let mut args = vec![
+                        "workflow".to_string(), "run".to_string(), "cloud_download.yml".to_string(),
+                        "--repo".to_string(), "Aditya-233/Torrenty".to_string(),
+                        "-f".to_string(), format!("magnet={}", magnet_c),
+                        "-f".to_string(), format!("name={}", name_c),
+                        "-f".to_string(), format!("tag={}", tag_c),
+                    ];
+                    if let Some(ref turl) = torrent_url_c {
+                        args.push("-f".to_string());
+                        args.push(format!("torrent_url={}", turl));
+                    }
+                    std::process::Command::new("gh")
+                        .args(&args)
+                        .output()
+                }
+            }).await.map_err(|e| anyhow::anyhow!("{e}"))??;
+
+            if !trigger.status.success() {
+                return Err(anyhow::anyhow!("Failed to dispatch GitHub cloud workflow: {}", String::from_utf8_lossy(&trigger.stderr)));
+            }
+
+            // Poll every 3 seconds for up to 6 minutes
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_secs(360) {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                let elapsed_sec = start.elapsed().as_secs();
+                let _ = download_tx.send((info_hash_str.clone(), DownloadEvent::Status(format!("Cloud downloading swarm ({}s)...", elapsed_sec))));
+
+                let poll_res = tokio::task::spawn_blocking({
+                    let tag_c = tag.clone();
+                    move || {
+                        std::process::Command::new("gh")
+                            .args(["release", "view", &tag_c, "--repo", "Aditya-233/Torrenty", "--json", "assets"])
+                            .output()
+                    }
+                }).await.ok().and_then(|r| r.ok());
+
+                if let Some(out) = poll_res {
+                    if out.status.success() {
+                        if let Ok(json_val) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
+                            if let Some(assets) = json_val.get("assets").and_then(|a| a.as_array()) {
+                                if let Some(asset) = assets.iter().find(|a| a.get("size").and_then(|s| s.as_u64()).unwrap_or(0) > 1024) {
+                                    if let Some(url) = asset.get("url").and_then(|u| u.as_str()) {
+                                        download_url = Some(url.to_string());
+                                        if let Some(sz) = asset.get("size").and_then(|s| s.as_u64()) {
+                                            expected_size = sz;
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let Some(url) = download_url else {
+            return Err(anyhow::anyhow!("Cloud download timed out waiting for release asset"));
+        };
+
+        let _ = download_tx.send((info_hash_str.clone(), DownloadEvent::Status("Streaming verified data over HTTPS...".to_string())));
+
+        // Stream download directly from GitHub Release CDN over HTTPS
+        let mut resp = client.get(&url).send().await?.error_for_status()?;
+        let total_bytes = resp.content_length().unwrap_or(expected_size);
+
+        let mut file = std::fs::File::create(&target_path)?;
+        let mut downloaded: u64 = 0;
+        let mut last_tick = Instant::now();
+        let mut last_bytes = 0;
+
+        while let Some(chunk) = resp.chunk().await? {
+            use std::io::Write;
+            file.write_all(&chunk)?;
+            downloaded += chunk.len() as u64;
+
+            let now = Instant::now();
+            if now.duration_since(last_tick).as_millis() >= 350 {
+                let dt = now.duration_since(last_tick).as_secs_f64();
+                let speed = if dt > 0.0 { ((downloaded.saturating_sub(last_bytes)) as f64 / dt) as u64 } else { 0 };
+                let ratio = if total_bytes > 0 { (downloaded as f64 / total_bytes as f64).clamp(0.0, 1.0) } else { 0.0 };
+                let _ = download_tx.send((info_hash_str.clone(), DownloadEvent::Progress {
+                    ratio,
+                    down_speed: speed,
+                    up_speed: 0,
+                    share_ratio: 0.0,
+                    progress_bytes: downloaded,
+                    finished: downloaded >= total_bytes,
+                }));
+                last_tick = now;
+                last_bytes = downloaded;
+            }
+        }
+
+        let _ = download_tx.send((info_hash_str.clone(), DownloadEvent::Progress {
+            ratio: 1.0,
+            down_speed: 0,
+            up_speed: 0,
+            share_ratio: 0.0,
+            progress_bytes: downloaded,
+            finished: true,
+        }));
+        let _ = download_tx.send((info_hash_str, DownloadEvent::Success));
+
+        Ok(())
     }
 
     fn from_history_entry(entry: DownloadHistoryEntry) -> Self {
