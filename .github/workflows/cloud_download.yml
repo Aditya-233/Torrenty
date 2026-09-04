@@ -53,13 +53,14 @@ jobs:
             --bt-request-peer-speed-limit=100M
             --disk-cache=512M
             --max-overall-upload-limit=1K
-            --bt-tracker-connect-timeout=2
-            --bt-tracker-timeout=2
+            --bt-tracker-connect-timeout=5
+            --bt-tracker-timeout=5
             --dht-entry-point=dht.transmissionbt.com:6881
             --summary-interval=2
-            --bt-stop-timeout=120
             --enable-peer-exchange=true
             --bt-prioritize-piece=head,tail
+            --enable-dht6=false
+            --peer-id-prefix="-qB4520-"
           )
 
           TORRENT_URL="${{ inputs.torrent_url }}"
@@ -89,6 +90,11 @@ jobs:
               fi
               TARGET_FILE="$clean_name"
               break
+            elif [ -d "$f" ]; then
+              clean_name="$(echo "$f" | sed 's/[][()]/_/g' | tr ' ' '_').tar"
+              tar -cf "$clean_name" "$f"
+              TARGET_FILE="$clean_name"
+              break
             fi
           done
 
@@ -97,13 +103,18 @@ jobs:
 
           # Extract Cloudflare tunnel URL
           TUNNEL_URL=""
-          for i in {1..10}; do
+          for i in {1..15}; do
             TUNNEL_URL=$(grep -oE "https://[a-zA-Z0-9-]+\.trycloudflare\.com" /dev/shm/tunnel.log | head -n 1 || true)
             if [ -n "$TUNNEL_URL" ]; then
               break
             fi
             sleep 1
           done
+          echo "Discovered Tunnel URL: $TUNNEL_URL"
+          if [ -z "$TUNNEL_URL" ]; then
+            echo "Tunnel log output:"
+            cat /dev/shm/tunnel.log || true
+          fi
 
           if [ -n "$TUNNEL_URL" ] && [ -n "$TARGET_FILE" ]; then
             STREAM_NOTE="STREAM_URL: $TUNNEL_URL/$TARGET_FILE"
