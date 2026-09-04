@@ -25,28 +25,47 @@ jobs:
     name: Fast Cloud Download
     runs-on: ubuntu-latest
     steps:
-      - name: Install aria2
-        run: sudo apt-get update && sudo apt-get install -y aria2
-
-      - name: Download torrent via aria2
+      - name: Fast Install aria2
         run: |
-          mkdir -p /tmp/dl
-          cd /tmp/dl
-          echo "Starting aria2 download for ${{ inputs.name }}..."
+          sudo apt-get install -y --no-install-recommends aria2 || (sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends aria2)
+
+      - name: Extreme Accelerated Torrent Download
+        run: |
+          # Use RAM-disk (/dev/shm) for zero disk I/O latency
+          mkdir -p /dev/shm/dl
+          cd /dev/shm/dl
+          echo "Starting extreme accelerated download for ${{ inputs.name }}..."
+
+          ARIA2_OPTS=(
+            --seed-time=0
+            --file-allocation=falloc
+            --bt-max-peers=250
+            --bt-request-peer-speed-limit=100M
+            --disk-cache=512M
+            --max-overall-upload-limit=1K
+            --bt-tracker-connect-timeout=2
+            --bt-tracker-timeout=2
+            --dht-entry-point=dht.transmissionbt.com:6881,router.bittorrent.com:6881,router.utorrent.com:6881
+            --summary-interval=2
+            --bt-stop-timeout=120
+            --enable-peer-exchange=true
+          )
+
           TORRENT_URL="${{ inputs.torrent_url }}"
           if [ -n "$TORRENT_URL" ]; then
-            echo "Attempting direct .torrent fetch from $TORRENT_URL..."
-            aria2c --seed-time=0 --max-connection-per-server=16 --split=16 --bt-stop-timeout=120 --summary-interval=5 "$TORRENT_URL" || true
+            echo "Direct .torrent download with high-speed peer flags..."
+            aria2c "${ARIA2_OPTS[@]}" "$TORRENT_URL" || true
           fi
-          
-          # If file not downloaded yet, fallback to magnet
-          if [ -z "$(ls -A /tmp/dl 2>/dev/null)" ]; then
-            echo "Downloading via magnet URI..."
-            aria2c --seed-time=0 --max-connection-per-server=16 --split=16 --bt-stop-timeout=300 --summary-interval=5 "${{ inputs.magnet }}"
+
+          # If media file not yet obtained, fallback to magnet
+          MEDIA_COUNT=$(find /dev/shm/dl -maxdepth 1 -type f ! -name "*.torrent" | wc -l)
+          if [ "$MEDIA_COUNT" -eq 0 ]; then
+            echo "Fallback to magnet URI with full tracker swarm..."
+            aria2c "${ARIA2_OPTS[@]}" "${{ inputs.magnet }}"
           fi
-          
-          echo "Downloaded files:"
-          ls -lh /tmp/dl
+
+          echo "Downloaded files in RAM disk:"
+          ls -lh /dev/shm/dl
 
       - name: Upload to Release
         env:
@@ -55,14 +74,18 @@ jobs:
           TAG="${{ inputs.tag }}"
           REPO="Aditya-233/Torrenty"
           gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1 || gh release create "$TAG" --repo "$REPO" --title "Torrent Cloud Downloads" --notes "Automated cloud torrent downloads for bypass users" || true
-          cd /tmp/dl
+          cd /dev/shm/dl
+          
+          # Remove .torrent files so only clean video payload is uploaded
+          rm -f *.torrent
+
           for f in *; do
             if [ -f "$f" ]; then
               clean_name="$(echo "$f" | sed 's/[][()]/_/g' | tr ' ' '_')"
               if [ "$clean_name" != "$f" ]; then
                 mv "$f" "$clean_name"
               fi
-              echo "Uploading $clean_name..."
+              echo "Fast uploading $clean_name..."
               gh release upload "$TAG" "$clean_name" --repo "$REPO" --clobber
             elif [ -d "$f" ]; then
               clean_name="$(echo "$f" | sed 's/[][()]/_/g' | tr ' ' '_').tar"
