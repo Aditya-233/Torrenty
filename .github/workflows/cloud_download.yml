@@ -25,14 +25,17 @@ jobs:
     name: Fast Cloud Download
     runs-on: ubuntu-latest
     steps:
-      - name: Restore Accelerator Tools
+      - name: Restore Accelerator Tools & DHT Cache
         uses: actions/cache/restore@v4
         id: cache-tools
         with:
           path: |
             /usr/local/bin/aria2c
             /usr/local/bin/cloudflared
-          key: cloud-tools-v5
+            /home/runner/.cache/aria2
+          key: cloud-tools-dht-v1
+          restore-keys: |
+            cloud-tools-dht-
 
       - name: Fast Zero-Install Tooling
         if: steps.cache-tools.outputs.cache-hit != 'true'
@@ -43,20 +46,22 @@ jobs:
           wait
           echo "Tooling ready: aria2, cloudflared"
 
-      - name: Save Accelerator Tools
+      - name: Save Accelerator Tools & DHT Cache
         if: steps.cache-tools.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: |
             /usr/local/bin/aria2c
             /usr/local/bin/cloudflared
-          key: cloud-tools-v5
+            /home/runner/.cache/aria2
+          key: cloud-tools-dht-v1
 
       - name: Extreme Accelerated Torrent Download & Stream
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Use RAM-disk (/dev/shm) for zero disk I/O latency (Strategy 6)
+          # Initialize DHT directory and memory workspace
+          mkdir -p /home/runner/.cache/aria2
           mkdir -p /dev/shm/dl
           cd /dev/shm/dl
           echo "Starting extreme accelerated download for ${{ inputs.name }}..."
