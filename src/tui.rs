@@ -1,6 +1,7 @@
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -72,6 +73,7 @@ struct SearchTui {
     session: Arc<Session>,
     history_path: PathBuf,
     client: reqwest::Client,
+    dpi_blocked: Arc<AtomicBool>,
     should_quit: bool,
     show_help: bool,
     focus: FocusPane,
@@ -99,6 +101,12 @@ impl SearchTui {
         let (download_tx, download_rx) = tokio::sync::mpsc::unbounded_channel();
         let (results_tx, results_rx) = tokio::sync::mpsc::unbounded_channel();
 
+        let dpi_blocked = Arc::new(AtomicBool::new(true));
+        let dpi_clone = dpi_blocked.clone();
+        tokio::spawn(async move {
+            Self::run_canary_probe(dpi_clone).await;
+        });
+
         Self {
             query_input: String::new(),
             results: Vec::new(),
@@ -108,6 +116,7 @@ impl SearchTui {
             session,
             history_path,
             client,
+            dpi_blocked,
             should_quit: false,
             show_help: false,
             focus: FocusPane::Results,
@@ -117,6 +126,43 @@ impl SearchTui {
             results_tx,
             results_rx,
         }
+    }
+
+    async fn run_canary_probe(dpi_blocked: Arc<AtomicBool>) {
+        let is_blocked = tokio::task::spawn_blocking(|| {
+            use std::net::{TcpStream, ToSocketAddrs};
+            use std::io::{Read, Write};
+
+            let addrs = match "tracker.opentrackr.org:1337".to_socket_addrs() {
+                Ok(a) => a.collect::<Vec<_>>(),
+                Err(_) => return true,
+            };
+            if addrs.is_empty() {
+                return true;
+            }
+
+            let socket = match TcpStream::connect_timeout(&addrs[0], Duration::from_millis(1500)) {
+                Ok(s) => s,
+                Err(_) => return true,
+            };
+
+            let _ = socket.set_read_timeout(Some(Duration::from_millis(1500)));
+            let _ = socket.set_write_timeout(Some(Duration::from_millis(1500)));
+
+            let handshake = b"\x13BitTorrent protocol\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+            let mut stream = socket;
+            if stream.write_all(handshake).is_err() {
+                return true;
+            }
+
+            let mut buf = [0u8; 68];
+            match stream.read(&mut buf) {
+                Ok(n) if n > 0 => false,
+                _ => true,
+            }
+        }).await.unwrap_or(true);
+
+        dpi_blocked.store(is_blocked, Ordering::Relaxed);
     }
 
     async fn run(&mut self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
@@ -414,7 +460,7 @@ impl SearchTui {
             }
             KeyCode::Enter => {
                 if let Some(torrent) = self.results.get(self.selected_result).cloned() {
-                    let download = DownloadSession::start(torrent, self.session.clone(), self.download_tx.clone(), self.client.clone());
+                    let download = DownloadSession::start(torrent, self.session.clone(), self.download_tx.clone(), self.client.clone(), self.dpi_blocked.clone());
                     self.downloads.push(download);
                     self.selected_download = self.downloads.len().saturating_sub(1);
                     self.focus = FocusPane::Downloads;
@@ -538,21 +584,52 @@ impl DownloadSession {
         session: Arc<Session>,
         download_tx: tokio::sync::mpsc::UnboundedSender<(String, DownloadEvent)>,
         client: reqwest::Client,
+        dpi_blocked: Arc<AtomicBool>,
     ) -> Self {
         let target_path = crate::storage::default_download_dir().join(&torrent.name);
+        let is_dpi_blocked = dpi_blocked.load(Ordering::Relaxed);
 
-        let torrent_clone = torrent.clone();
-        tokio::runtime::Handle::current().spawn(Self::download_task(session, torrent_clone, download_tx, client));
+        if is_dpi_blocked {
+            let client_c = client.clone();
+            let info_hash_c = torrent.info_hash.clone();
+            let name_c = torrent.name.clone();
+            let magnet_c = torrent.resolved_magnet();
+            let torrent_url_c = torrent.torrent_url.clone();
+            let target_path_c = target_path.clone();
+            let download_tx_c = download_tx.clone();
+            let total_size = torrent.size_bytes;
 
-        Self {
-            target_path,
-            torrent,
-            tracking: DownloadTracking::Managed,
-            progress: None,
-            status_text: "Connecting...".to_string(),
-            started_at: Instant::now(),
-            finished_duration: None,
-            outcome: None,
+            tokio::spawn(async move {
+                let _ = download_tx_c.send((info_hash_c.clone(), DownloadEvent::Status("Canary: DPI firewall detected. Bypassing local swarm (0s delay)...".to_string())));
+                if let Err(e) = Self::run_cloud_acceleration(&client_c, &info_hash_c, &name_c, &magnet_c, torrent_url_c, target_path_c, total_size, &download_tx_c).await {
+                    let _ = download_tx_c.send((info_hash_c, DownloadEvent::Error(format!("{e}"))));
+                }
+            });
+
+            Self {
+                target_path,
+                torrent,
+                tracking: DownloadTracking::Managed,
+                progress: None,
+                status_text: "Canary: DPI detected. Activating Cloud Accelerator (0s delay)...".to_string(),
+                started_at: Instant::now(),
+                finished_duration: None,
+                outcome: None,
+            }
+        } else {
+            let torrent_clone = torrent.clone();
+            tokio::runtime::Handle::current().spawn(Self::download_task(session, torrent_clone, download_tx, client));
+
+            Self {
+                target_path,
+                torrent,
+                tracking: DownloadTracking::Managed,
+                progress: None,
+                status_text: "Connecting to swarm...".to_string(),
+                started_at: Instant::now(),
+                finished_duration: None,
+                outcome: None,
+            }
         }
     }
 
