@@ -6,7 +6,30 @@ use crate::types::Torrent;
 use crate::util::{parse_opt_string, parse_string, parse_u32, parse_u64};
 
 pub fn build_client() -> Result<Client> {
-    Client::builder().user_agent("torrentty/0.1").build().context("failed to build HTTP client")
+    let mut builder = Client::builder()
+        .user_agent("Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0");
+
+    let mut proxy_set = false;
+    for var in ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"] {
+        if let Ok(val) = std::env::var(var) {
+            let val = val.trim();
+            if !val.is_empty() {
+                if let Ok(proxy) = reqwest::Proxy::all(val) {
+                    builder = builder.proxy(proxy);
+                    proxy_set = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    if !proxy_set {
+        if let Ok(proxy) = reqwest::Proxy::all("http://127.0.0.1:8080") {
+            builder = builder.proxy(proxy);
+        }
+    }
+
+    builder.build().context("failed to build HTTP client")
 }
 
 pub async fn search_piratebay(client: &Client, query: &str, limit: usize) -> Result<Vec<Torrent>> {
@@ -37,37 +60,63 @@ struct ApiTorrent {
 
 impl From<ApiTorrent> for Torrent {
     fn from(value: ApiTorrent) -> Self {
-        Self { name: value.name, info_hash: value.info_hash.unwrap_or_default(), magnet: value.magnet, seeders: value.seeders, size_bytes: value.size_bytes }
+        Self {
+            name: value.name,
+            info_hash: value.info_hash.unwrap_or_default(),
+            magnet: value.magnet,
+            torrent_url: None,
+            seeders: value.seeders,
+            size_bytes: value.size_bytes,
+        }
     }
 }
 
 pub async fn search_nyaa(client: &Client, query: &str, limit: usize) -> Result<Vec<Torrent>> {
-    let response = client.get("https://nyaa.si/?page=rss").query(&[("q", query), ("c", "0_0"), ("f", "0")]).send().await?.error_for_status()?;
+    let mut last_err = None;
+    for _ in 0..3 {
+        match client.get("https://nyaa.si/?page=rss").query(&[("q", query), ("c", "0_0"), ("f", "0")]).send().await {
+            Ok(resp) => match resp.error_for_status() {
+                Ok(response) => {
+                    let body = response.text().await?;
+                    let mut results = Vec::new();
+                    for item_str in body.split("<item>").skip(1) {
+                        let end = item_str.find("</item>").unwrap_or(item_str.len());
+                        let item_xml = &item_str[..end];
 
-    let body = response.text().await?;
-    let mut results = Vec::new();
-    for item_str in body.split("<item>").skip(1) {
-        let end = item_str.find("</item>").unwrap_or(item_str.len());
-        let item_xml = &item_str[..end];
+                        let name = extract_xml_tag(item_xml, "<title>", "</title>").unwrap_or_default().to_string();
+                        let info_hash = extract_xml_tag(item_xml, "<nyaa:infoHash>", "</nyaa:infoHash>").unwrap_or_default().to_string();
+                        if info_hash.is_empty() {
+                            continue;
+                        }
 
-        let name = extract_xml_tag(item_xml, "<title>", "</title>").unwrap_or_default().to_string();
-        let info_hash = extract_xml_tag(item_xml, "<nyaa:infoHash>", "</nyaa:infoHash>").unwrap_or_default().to_string();
-        if info_hash.is_empty() {
-            continue;
+                        let torrent_url = extract_xml_tag(item_xml, "<link>", "</link>").map(|s| s.to_string());
+                        let size_str = extract_xml_tag(item_xml, "<nyaa:size>", "</nyaa:size>").unwrap_or_default();
+                        let size_bytes = parse_nyaa_size(size_str);
+                        let seeders = extract_xml_tag(item_xml, "<nyaa:seeders>", "</nyaa:seeders>").unwrap_or_default().parse().unwrap_or(0);
+                        let magnet = Some(crate::util::build_magnet_link(&info_hash, &name));
+
+                        results.push(Torrent {
+                            name,
+                            info_hash,
+                            magnet,
+                            torrent_url,
+                            seeders,
+                            size_bytes,
+                        });
+
+                        if results.len() >= limit {
+                            break;
+                        }
+                    }
+                    return Ok(results);
+                }
+                Err(e) => last_err = Some(anyhow::anyhow!(e)),
+            },
+            Err(e) => last_err = Some(anyhow::anyhow!(e)),
         }
-
-        let size_str = extract_xml_tag(item_xml, "<nyaa:size>", "</nyaa:size>").unwrap_or_default();
-        let size_bytes = parse_nyaa_size(size_str);
-        let seeders = extract_xml_tag(item_xml, "<nyaa:seeders>", "</nyaa:seeders>").unwrap_or_default().parse().unwrap_or(0);
-        let magnet = Some(crate::util::build_magnet_link(&info_hash, &name));
-
-        results.push(Torrent { name, info_hash, magnet, seeders, size_bytes });
-
-        if results.len() >= limit {
-            break;
-        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
-    Ok(results)
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("failed to search nyaa after 3 attempts")))
 }
 
 fn extract_xml_tag<'a>(xml: &'a str, start_tag: &str, end_tag: &str) -> Option<&'a str> {

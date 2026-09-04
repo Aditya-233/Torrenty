@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode};
-use librqbit::{AddTorrent, Session};
+use librqbit::{AddTorrent, AddTorrentOptions, Session};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -395,7 +395,7 @@ impl SearchTui {
             }
             KeyCode::Enter => {
                 if let Some(torrent) = self.results.get(self.selected_result).cloned() {
-                    let download = DownloadSession::start(torrent, self.session.clone(), self.download_tx.clone());
+                    let download = DownloadSession::start(torrent, self.session.clone(), self.download_tx.clone(), self.client.clone());
                     self.downloads.push(download);
                     self.selected_download = self.downloads.len().saturating_sub(1);
                     self.focus = FocusPane::Downloads;
@@ -514,13 +514,16 @@ struct DownloadSession {
 }
 
 impl DownloadSession {
-    fn start(torrent: Torrent, session: Arc<Session>, download_tx: tokio::sync::mpsc::UnboundedSender<(String, DownloadEvent)>) -> Self {
+    fn start(
+        torrent: Torrent,
+        session: Arc<Session>,
+        download_tx: tokio::sync::mpsc::UnboundedSender<(String, DownloadEvent)>,
+        client: reqwest::Client,
+    ) -> Self {
         let target_path = PathBuf::from(".").join(&torrent.name);
 
-        let magnet = torrent.resolved_magnet();
-        let info_hash = torrent.info_hash.clone();
-
-        tokio::runtime::Handle::current().spawn(Self::download_task(session, magnet, info_hash, download_tx));
+        let torrent_clone = torrent.clone();
+        tokio::runtime::Handle::current().spawn(Self::download_task(session, torrent_clone, download_tx, client));
 
         Self {
             target_path,
@@ -534,12 +537,46 @@ impl DownloadSession {
         }
     }
 
-    async fn download_task(session: Arc<Session>, magnet: String, info_hash: String, download_tx: tokio::sync::mpsc::UnboundedSender<(String, DownloadEvent)>) {
-        let _ = download_tx.send((info_hash.clone(), DownloadEvent::Status("Adding torrent to rqbit...".to_string())));
+    async fn download_task(
+        session: Arc<Session>,
+        torrent: Torrent,
+        download_tx: tokio::sync::mpsc::UnboundedSender<(String, DownloadEvent)>,
+        client: reqwest::Client,
+    ) {
+        let info_hash = torrent.info_hash.clone();
+        let add_opts = AddTorrentOptions {
+            overwrite: true,
+            trackers: Some(crate::util::DEFAULT_HTTPS_TRACKERS.iter().map(|s| s.to_string()).collect()),
+            ..Default::default()
+        };
 
-        let add_request = AddTorrent::from_url(&magnet);
+        let magnet = torrent.resolved_magnet();
+        let add_request = if let Some(ref url) = torrent.torrent_url {
+            let _ = download_tx.send((info_hash.clone(), DownloadEvent::Status("Downloading .torrent metadata...".to_string())));
+            let mut file_bytes = None;
+            for _ in 0..3 {
+                if let Ok(resp) = client.get(url).send().await {
+                    if resp.status().is_success() {
+                        if let Ok(bytes) = resp.bytes().await {
+                            file_bytes = Some(bytes);
+                            break;
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            if let Some(bytes) = file_bytes {
+                AddTorrent::TorrentFileBytes(bytes)
+            } else {
+                let _ = download_tx.send((info_hash.clone(), DownloadEvent::Status("Adding magnet link...".to_string())));
+                AddTorrent::from_url(&magnet)
+            }
+        } else {
+            let _ = download_tx.send((info_hash.clone(), DownloadEvent::Status("Adding magnet link...".to_string())));
+            AddTorrent::from_url(&magnet)
+        };
 
-        match session.add_torrent(add_request, None).await {
+        match session.add_torrent(add_request, Some(add_opts)).await {
             Ok(response) => {
                 let Some(handle) = response.into_handle() else {
                     let _ = download_tx.send((info_hash.clone(), DownloadEvent::Error("Torrent added but no handle was returned.".to_string())));
@@ -600,7 +637,14 @@ impl DownloadSession {
     }
 
     fn from_history_entry(entry: DownloadHistoryEntry) -> Self {
-        let torrent = Torrent { name: entry.name.clone(), info_hash: entry.info_hash.clone(), magnet: None, seeders: 0, size_bytes: 0 };
+        let torrent = Torrent {
+            name: entry.name.clone(),
+            info_hash: entry.info_hash.clone(),
+            magnet: None,
+            torrent_url: None,
+            seeders: 0,
+            size_bytes: 0,
+        };
         let duration_secs = entry.completed_at_epoch_secs.unwrap_or(entry.added_at_epoch_secs).saturating_sub(entry.added_at_epoch_secs);
 
         Self {
