@@ -998,9 +998,7 @@ impl DownloadSession {
     }
 
     fn progress_summary(&self) -> String {
-        if matches!(self.tracking, DownloadTracking::History) {
-            "hist ".to_string()
-        } else if let Some(p) = self.progress {
+        if let Some(p) = self.progress {
             format!("{:>5.1}%", p * 100.0)
         } else if matches!(self.outcome, Some(DownloadOutcome::Success)) {
             "100.0%".to_string()
@@ -1010,10 +1008,6 @@ impl DownloadSession {
     }
 
     fn status_badge(&self) -> Span<'static> {
-        if matches!(self.tracking, DownloadTracking::History) {
-            return Span::styled(" hist ", Style::default().fg(SURFACE0).bg(GREEN));
-        }
-
         match self.outcome {
             Some(DownloadOutcome::Success) => Span::styled(" done ", Style::default().fg(SURFACE0).bg(GREEN)),
             Some(DownloadOutcome::Failed) => Span::styled(" fail ", Style::default().fg(TEXT).bg(RED)),
