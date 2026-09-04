@@ -8,3 +8,4 @@
 *.user
 *.userosv
 *.suo
+.cargo/
