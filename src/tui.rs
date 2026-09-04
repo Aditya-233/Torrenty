@@ -849,6 +849,8 @@ impl DownloadSession {
                                             download_url = Some(u.to_string());
                                             break;
                                         }
+                                    } else if let Some(rest) = line.strip_prefix("ERROR:") {
+                                        return Err(anyhow::anyhow!("Cloud accelerator failed: {}", rest.trim()));
                                     }
                                 }
                             }

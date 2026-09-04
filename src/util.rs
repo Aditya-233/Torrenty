@@ -16,10 +16,10 @@ pub fn format_size(bytes: u64) -> String {
 }
 
 pub const DEFAULT_HTTPS_TRACKERS: &[&str] = &[
-    "http://nyaa.tracker.wf:7777/announce",
     "https://tracker.pmman.tech:443/announce",
+    "https://tracker.tamersunion.org:443/announce",
     "https://tracker.nekobt.to/api/tracker/public/announce",
-    "https://004430.xyz:443/announce",
+    "http://nyaa.tracker.wf:7777/announce",
     "https://tracker.nekomi.cn:443/announce",
     "https://1337.abcvg.info:443/announce",
     "https://tracker.leechshield.link:443/announce",
@@ -28,20 +28,27 @@ pub const DEFAULT_HTTPS_TRACKERS: &[&str] = &[
 ];
 
 const PRE_ENCODED_TRACKERS: &[&str] = &[
-    "http%3A%2F%2Fnyaa.tracker.wf%3A7777%2Fannounce",
+    // Universal high-speed public UDP trackers (ngosang trackerslist top tier)
+    "udp%3A%2F%2Ftracker.opentrackr.org%3A1337%2Fannounce",
+    "udp%3A%2F%2Fopen.stealth.si%3A80%2Fannounce",
+    "udp%3A%2F%2Ftracker.torrent.eu.org%3A451%2Fannounce",
+    "udp%3A%2F%2Fopen.demonii.com%3A1337%2Fannounce",
+    "udp%3A%2F%2Ftracker.therarbg.to%3A6969%2Fannounce",
+    "udp%3A%2F%2Ftracker.dler.org%3A6969%2Fannounce",
+    "udp%3A%2F%2Fexplodie.org%3A6969%2Fannounce",
+    "udp%3A%2F%2Fzer0day.ch%3A1337%2Fannounce",
+    "udp%3A%2F%2Ftracker.qu.ax%3A6969%2Fannounce",
+    // Universal HTTPS trackers
     "https%3A%2F%2Ftracker.pmman.tech%3A443%2Fannounce",
+    "https%3A%2F%2Ftracker.tamersunion.org%3A443%2Fannounce",
     "https%3A%2F%2Ftracker.nekobt.to%2Fapi%2Ftracker%2Fpublic%2Fannounce",
-    "https%3A%2F%2F004430.xyz%3A443%2Fannounce",
+    // Dedicated anime / Nyaa trackers
+    "http%3A%2F%2Fnyaa.tracker.wf%3A7777%2Fannounce",
     "https%3A%2F%2Ftracker.nekomi.cn%3A443%2Fannounce",
     "https%3A%2F%2F1337.abcvg.info%3A443%2Fannounce",
     "https%3A%2F%2Ftracker.leechshield.link%3A443%2Fannounce",
     "https%3A%2F%2Ftracker.7471.top%3A443%2Fannounce",
     "https%3A%2F%2Ftracker.foreverpirates.co%3A443%2Fannounce",
-    // Standard UDP fallback trackers for unrestricted networks
-    "udp%3A%2F%2Ftracker.opentrackr.org%3A1337%2Fannounce",
-    "udp%3A%2F%2Fopen.stealth.si%3A80%2Fannounce",
-    "udp%3A%2F%2Ftracker.torrent.eu.org%3A451%2Fannounce",
-    "udp%3A%2F%2Fexplodie.org%3A6969%2Fannounce",
 ];
 
 #[must_use]

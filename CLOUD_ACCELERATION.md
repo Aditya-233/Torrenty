@@ -41,7 +41,7 @@ Torrenty accelerates torrent downloads by offloading BitTorrent swarm discovery 
   - `--bt-max-peers=500`: Connects to up to 500 peers across the global swarm.
   - `--bt-request-peer-speed-limit=200M`: Forces aria2 to continuously request and hunt for more peers until download speed hits 200 MB/s.
   - `--disk-cache=512M`: Minimizes internal buffer thrashing.
-  - `--dht-entry-point=dht.transmissionbt.com:6881`: Instant bootstrap into Transmission/Mainline DHT networks.
+  - `--dht-entry-point=router.bittorrent.com:6881`: Root Mainline BitTorrent DHT bootstrap router with millions of nodes.
 * **Result**: 1.40 GB downloaded in **~14–20 s**, sustaining **105+ MiB/s**.
 
 ### Stage 3: Direct High-Speed Client Streaming
@@ -71,6 +71,7 @@ Torrenty accelerates torrent downloads by offloading BitTorrent swarm discovery 
 | Unbounded `tokio::join!` indexer calls | Wait for all indexers without timeout | Dead indexers (PirateBay) blocked fast indexers (Nyaa). | **DISCARDED** (Independent bounded timeouts + atomic render) |
 | Omitting `--bt-tracker` on `.torrent` | Assume `.torrent` embedded tracker suffices | Tracker failure stalled aria2c at `CN:50 SD:0` indefinitely. | **DISCARDED** (Inject public trackers + bt-stop-timeout) |
 | Premature Tunnel Shutdown & Blanket 10s Timeout | Wait only for `gh release upload` to exit | Tunnel died after 29s mid-client stream; 10s timeout aborted chunks | **DISCARDED** (Activity-based hold + 600s override + CDN failover) |
+| Niche trackers first + `--bt-stop-timeout=60` on magnet | Assume anime tracker works for all; short timeout kills stalls | Nyaa tracker rejected movie hashes; 60s timeout killed metadata exchange at DL:0B | **DISCARDED** (Universal trackers first + 180s stop timeout + fast empty exit) |
 
 ---
 

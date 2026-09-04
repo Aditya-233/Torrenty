@@ -122,7 +122,7 @@ jobs:
 
           cloudflared tunnel --url http://127.0.0.1:8080 > /dev/shm/tunnel.log 2>&1 &
 
-          PUBLIC_TRACKERS="udp://tracker.opentrackr.org:1337/announce,udp://open.stealth.si:80/announce,udp://tracker.torrent.eu.org:451/announce,udp://explodie.org:6969/announce,http://nyaa.tracker.wf:7777/announce,https://tracker.pmman.tech:443/announce,https://tracker.nekobt.to/api/tracker/public/announce,https://tracker.nekomi.cn:443/announce,https://tracker.leechshield.link:443/announce,https://tracker.7471.top:443/announce,https://tracker.foreverpirates.co:443/announce"
+          PUBLIC_TRACKERS="udp://tracker.opentrackr.org:1337/announce,udp://open.stealth.si:80/announce,udp://tracker.torrent.eu.org:451/announce,udp://open.demonii.com:1337/announce,udp://tracker.therarbg.to:6969/announce,udp://tracker.dler.org:6969/announce,udp://explodie.org:6969/announce,udp://zer0day.ch:1337/announce,udp://tracker.qu.ax:6969/announce,https://tracker.pmman.tech:443/announce,https://tracker.tamersunion.org:443/announce,https://tracker.nekobt.to/api/tracker/public/announce,http://nyaa.tracker.wf:7777/announce,https://tracker.nekomi.cn:443/announce,https://tracker.leechshield.link:443/announce,https://tracker.7471.top:443/announce,https://tracker.foreverpirates.co:443/announce"
 
           ARIA2_OPTS=(
             --seed-time=0
@@ -133,10 +133,11 @@ jobs:
             --max-overall-upload-limit=1K
             --bt-tracker-connect-timeout=5
             --bt-tracker-timeout=5
-            --dht-entry-point=dht.transmissionbt.com:6881
+            --dht-entry-point=router.bittorrent.com:6881
             --summary-interval=1
             --enable-peer-exchange=true
             --bt-tracker="$PUBLIC_TRACKERS"
+            --bt-save-metadata=true
           )
 
           TORRENT_URL="${{ inputs.torrent_url }}"
@@ -149,7 +150,7 @@ jobs:
           MEDIA_COUNT=$(find /dev/shm/dl -maxdepth 2 -type f ! -name "*.torrent" ! -name "*.dat" ! -name "*.aria2" | wc -l)
           if [ "$MEDIA_COUNT" -eq 0 ]; then
             echo "Fallback to magnet URI with full tracker swarm..."
-            aria2c "${ARIA2_OPTS[@]}" --bt-stop-timeout=60 "${{ inputs.magnet }}"
+            aria2c "${ARIA2_OPTS[@]}" --bt-stop-timeout=180 "${{ inputs.magnet }}" || true
           fi
 
           echo "Downloaded files in RAM disk:"
@@ -179,6 +180,13 @@ jobs:
 
           TAG="${{ inputs.tag }}"
           REPO="Aditya-233/Torrenty"
+
+          if [ -z "$TARGET_FILE" ]; then
+            echo "ERROR: Failed to download torrent payload. Swarm inactive or metadata resolution failed."
+            gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1 || gh release create "$TAG" --repo "$REPO" --title "Torrent Cloud Downloads" --notes "ERROR: Download failed. No swarm peers or metadata unavailable." || true
+            gh release edit "$TAG" --repo "$REPO" --notes "ERROR: Download failed. No swarm peers or metadata unavailable." 2>/dev/null || true
+            exit 1
+          fi
 
           # Extract Cloudflare tunnel URL
           TUNNEL_URL=""

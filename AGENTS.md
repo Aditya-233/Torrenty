@@ -99,6 +99,18 @@ Future agents **MUST NOT** reintroduce any of the following failed approaches. E
   - **Resilient Chunk Retry**: Range workers must retry with exponential backoff right from `current_offset`.
   - **GitHub Release CDN Auto-Failover**: If the Cloudflare Tunnel drops or resets, workers automatically fail over to the permanent GitHub Release asset URL (`https://github.com/{REPO}/releases/download/{TAG}/{FILE}`) to resume downloading without losing progress.
 
+### ❌ 13. NEVER place restricted/niche trackers before universal open trackers or use aggressive `--bt-stop-timeout` on magnet metadata resolution
+* **What went wrong**: In workflow run 33912205744 (Godfather BrRip x264 from PirateBay), the magnet download failed because:
+  1. `http://nyaa.tracker.wf:7777/announce` was the first tracker in the magnet link and `ARIA2_OPTS`, which immediately rejected the non-Nyaa infohash (`info hash is not authorized with this tracker`).
+  2. Sequential tracker timeouts across 9 anime trackers took over 45–60s.
+  3. Setting `--bt-stop-timeout=60` terminated aria2 at the 60.0s mark while it was still exchanging BEP-9 metadata (`DL:0B`), because download speed is 0 B/s before payload pieces start transferring.
+  4. Once aria2 terminated with no files downloaded, the workflow lingered in an idle loop waiting for tunnel clients on a nonexistent target file.
+* **Correct Implementation**:
+  - Always place universal public UDP trackers (`udp://tracker.opentrackr.org:1337/announce`, `udp://open.stealth.si:80/announce`, `udp://tracker.torrent.eu.org:451/announce`, `udp://open.demonii.com:1337/announce`, `udp://tracker.therarbg.to:6969/announce`) at the very top of `PRE_ENCODED_TRACKERS` and `PUBLIC_TRACKERS`.
+  - Use `router.bittorrent.com:6881` as primary `--dht-entry-point` and enable `--bt-save-metadata=true`.
+  - On magnet fallback downloads, allow generous stop timeout (`--bt-stop-timeout=180`) so metadata resolution over DHT/trackers has time to locate peers.
+  - Fail the workflow immediately (`exit 1`) if `TARGET_FILE` is empty, setting release notes to `ERROR: ...` so the local client terminates instantly instead of waiting 6 minutes.
+
 ---
 
 ## 3. Proven High-Performance Configuration Reference
@@ -106,7 +118,7 @@ Future agents **MUST NOT** reintroduce any of the following failed approaches. E
 The following aria2 options in `.github/workflows/cloud_download.yml` are production-proven:
 
 ```bash
-PUBLIC_TRACKERS="udp://tracker.opentrackr.org:1337/announce,udp://open.stealth.si:80/announce,udp://tracker.torrent.eu.org:451/announce,udp://explodie.org:6969/announce,http://nyaa.tracker.wf:7777/announce,https://tracker.pmman.tech:443/announce,https://tracker.nekobt.to/api/tracker/public/announce,https://tracker.nekomi.cn:443/announce,https://tracker.leechshield.link:443/announce,https://tracker.7471.top:443/announce,https://tracker.foreverpirates.co:443/announce"
+PUBLIC_TRACKERS="udp://tracker.opentrackr.org:1337/announce,udp://open.stealth.si:80/announce,udp://tracker.torrent.eu.org:451/announce,udp://open.demonii.com:1337/announce,udp://tracker.therarbg.to:6969/announce,udp://tracker.dler.org:6969/announce,udp://explodie.org:6969/announce,udp://zer0day.ch:1337/announce,udp://tracker.qu.ax:6969/announce,https://tracker.pmman.tech:443/announce,https://tracker.tamersunion.org:443/announce,https://tracker.nekobt.to/api/tracker/public/announce,http://nyaa.tracker.wf:7777/announce,https://tracker.nekomi.cn:443/announce,https://tracker.leechshield.link:443/announce,https://tracker.7471.top:443/announce,https://tracker.foreverpirates.co:443/announce"
 
 ARIA2_OPTS=(
   --seed-time=0
@@ -117,10 +129,11 @@ ARIA2_OPTS=(
   --max-overall-upload-limit=1K
   --bt-tracker-connect-timeout=5
   --bt-tracker-timeout=5
-  --dht-entry-point=dht.transmissionbt.com:6881
+  --dht-entry-point=router.bittorrent.com:6881
   --summary-interval=1
   --enable-peer-exchange=true
   --bt-tracker="$PUBLIC_TRACKERS"
+  --bt-save-metadata=true
 )
 ```
 
