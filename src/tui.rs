@@ -92,11 +92,8 @@ enum FocusPane {
 }
 
 impl SearchTui {
-    fn new(session: Arc<Session>, history_entries: Vec<DownloadHistoryEntry>, history_path: PathBuf, client: reqwest::Client) -> Self {
-        let mut downloads: Vec<DownloadSession> = Vec::new();
-        for entry in history_entries {
-            downloads.push(DownloadSession::from_history_entry(entry));
-        }
+    fn new(session: Arc<Session>, _history_entries: Vec<DownloadHistoryEntry>, history_path: PathBuf, client: reqwest::Client) -> Self {
+        let downloads: Vec<DownloadSession> = Vec::new();
 
         let (download_tx, download_rx) = tokio::sync::mpsc::unbounded_channel();
         let (results_tx, results_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -509,21 +506,62 @@ impl SearchTui {
         let limit = 50;
 
         tokio::spawn(async move {
-            let pb_future = crate::indexer::search_piratebay(&client, &query_str, limit);
-            let nyaa_future = crate::indexer::search_nyaa(&client, &query_str, limit);
-            let (pb_res, nyaa_res) = tokio::join!(pb_future, nyaa_future);
+            crate::log_info!("Initiating parallel indexer search for '{}'", query_str);
+            let client_nyaa = client.clone();
+            let query_nyaa = query_str.clone();
+            let client_pb = client.clone();
+            let query_pb = query_str.clone();
 
-            let mut combined = Vec::with_capacity(limit * 2);
-            if let Ok(mut res) = pb_res {
-                combined.append(&mut res);
-            }
-            if let Ok(mut res) = nyaa_res {
-                combined.append(&mut res);
+            let (nyaa_tx, mut nyaa_rx) = tokio::sync::mpsc::channel(1);
+            let (pb_tx, mut pb_rx) = tokio::sync::mpsc::channel(1);
+
+            tokio::spawn(async move {
+                let res = crate::indexer::search_nyaa(&client_nyaa, &query_nyaa, limit).await;
+                let _ = nyaa_tx.send(res).await;
+            });
+
+            tokio::spawn(async move {
+                let res = crate::indexer::search_piratebay(&client_pb, &query_pb, limit).await;
+                let _ = pb_tx.send(res).await;
+            });
+
+            let mut all_results = Vec::new();
+            let mut nyaa_done = false;
+            let mut pb_done = false;
+
+            while !nyaa_done || !pb_done {
+                tokio::select! {
+                    res = nyaa_rx.recv(), if !nyaa_done => {
+                        nyaa_done = true;
+                        if let Some(Ok(mut r)) = res {
+                            crate::log_info!("Nyaa search completed with {} results; publishing to UI", r.len());
+                            all_results.append(&mut r);
+                            all_results.sort_unstable_by_key(|right| std::cmp::Reverse(right.seeders));
+                            all_results.truncate(limit);
+                            let _ = results_tx.send(Ok(all_results.clone()));
+                        }
+                    }
+                    res = pb_rx.recv(), if !pb_done => {
+                        pb_done = true;
+                        if let Some(Ok(mut r)) = res {
+                            crate::log_info!("PirateBay search completed with {} results", r.len());
+                            if !r.is_empty() {
+                                all_results.append(&mut r);
+                                all_results.sort_unstable_by_key(|right| std::cmp::Reverse(right.seeders));
+                                all_results.truncate(limit);
+                                let _ = results_tx.send(Ok(all_results.clone()));
+                            }
+                        }
+                    }
+                }
             }
 
-            combined.sort_unstable_by_key(|right| std::cmp::Reverse(right.seeders));
-            combined.truncate(limit);
-            let _ = results_tx.send(Ok(combined));
+            if all_results.is_empty() {
+                crate::log_warn!("Both indexers completed with 0 total results for '{}'", query_str);
+                let _ = results_tx.send(Ok(Vec::new()));
+            } else {
+                crate::log_info!("Search finished with {} total sorted results for '{}'", all_results.len(), query_str);
+            }
         });
     }
 
@@ -977,6 +1015,7 @@ impl DownloadSession {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn from_history_entry(entry: DownloadHistoryEntry) -> Self {
         let torrent = Torrent {
             name: entry.name.clone(),
@@ -1090,6 +1129,7 @@ enum DownloadOutcome {
     Aborted,
 }
 
+#[allow(dead_code)]
 enum DownloadTracking {
     Managed,
     History,

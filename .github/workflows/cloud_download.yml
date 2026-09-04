@@ -113,6 +113,8 @@ jobs:
 
           cloudflared tunnel --url http://127.0.0.1:8080 > /dev/shm/tunnel.log 2>&1 &
 
+          PUBLIC_TRACKERS="udp://tracker.opentrackr.org:1337/announce,udp://open.stealth.si:80/announce,udp://tracker.torrent.eu.org:451/announce,udp://explodie.org:6969/announce,http://nyaa.tracker.wf:7777/announce,https://tracker.pmman.tech:443/announce,https://tracker.nekobt.to/api/tracker/public/announce,https://tracker.nekomi.cn:443/announce,https://tracker.leechshield.link:443/announce,https://tracker.7471.top:443/announce,https://tracker.foreverpirates.co:443/announce"
+
           ARIA2_OPTS=(
             --seed-time=0
             --file-allocation=falloc
@@ -125,28 +127,32 @@ jobs:
             --dht-entry-point=dht.transmissionbt.com:6881
             --summary-interval=1
             --enable-peer-exchange=true
+            --bt-tracker="$PUBLIC_TRACKERS"
           )
 
           TORRENT_URL="${{ inputs.torrent_url }}"
           if [ -n "$TORRENT_URL" ]; then
             echo "Direct .torrent download with tuned peer flags..."
-            aria2c "${ARIA2_OPTS[@]}" "$TORRENT_URL" || true
+            aria2c "${ARIA2_OPTS[@]}" --bt-stop-timeout=25 "$TORRENT_URL" || true
           fi
 
           # If media file not yet obtained, fallback to magnet
-          MEDIA_COUNT=$(find /dev/shm/dl -maxdepth 2 -type f ! -name "*.torrent" ! -name "*.dat" | wc -l)
+          MEDIA_COUNT=$(find /dev/shm/dl -maxdepth 2 -type f ! -name "*.torrent" ! -name "*.dat" ! -name "*.aria2" | wc -l)
           if [ "$MEDIA_COUNT" -eq 0 ]; then
             echo "Fallback to magnet URI with full tracker swarm..."
-            aria2c "${ARIA2_OPTS[@]}" "${{ inputs.magnet }}"
+            aria2c "${ARIA2_OPTS[@]}" --bt-stop-timeout=60 "${{ inputs.magnet }}"
           fi
 
           echo "Downloaded files in RAM disk:"
           ls -lh /dev/shm/dl
 
-          # Clean up names
-          rm -f *.torrent
+          # Clean up names and metadata files
+          rm -f *.torrent *.aria2
           TARGET_FILE=""
           for f in *; do
+            case "$f" in
+              *.torrent|*.aria2|*.dat) continue ;;
+            esac
             if [ -f "$f" ]; then
               clean_name="$(echo "$f" | sed 's/[][()]/_/g' | tr ' ' '_')"
               if [ "$clean_name" != "$f" ]; then

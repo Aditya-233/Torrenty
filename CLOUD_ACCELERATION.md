@@ -67,6 +67,9 @@ Torrenty accelerates torrent downloads by offloading BitTorrent swarm discovery 
 | `--split=64` | Thought it accelerated torrent piece downloading | Causes tracker rate-limiting (split is for HTTP/FTP). | **DISCARDED** |
 | `--bt-prioritize-piece=head,tail` | Download beginning and end first | Stalled swarm piece distribution. | **DISCARDED** |
 | Release Asset Reuse | Skip download if file exists | User requires fresh runs; prevents true testing. | **REMOVED** (Use dynamic tags) |
+| `socks5://` local DNS resolution | Assume local DNS is unaffected | Local DNS poisoned by ISP; caused indexer searches to hang. | **DISCARDED** (Use `socks5h://`) |
+| Unbounded `tokio::join!` indexer calls | Wait for all indexers together | Dead indexers (PirateBay) blocked fast indexers (Nyaa). | **DISCARDED** (Independent timeouts & streaming) |
+| Omitting `--bt-tracker` on `.torrent` | Assume `.torrent` embedded tracker suffices | Tracker failure stalled aria2c at `CN:50 SD:0` indefinitely. | **DISCARDED** (Inject public trackers + bt-stop-timeout) |
 
 ---
 

@@ -66,6 +66,30 @@ Future agents **MUST NOT** reintroduce any of the following failed approaches. E
 * **What went wrong**: Wasted 13–15 seconds on every CI run updating apt lists and downloading deb packages.
 * **Correct Implementation**: Use `actions/cache/restore@v4` with pre-cached static musl binaries (`aria2c` and `cloudflared`), bringing tooling setup time down to **2.0s** (85% reduction).
 
+### ❌ 9. NEVER use `socks5://` instead of `socks5h://` or block concurrently on unresponsive indexers
+* **What went wrong**:
+  1. `socks5://` performs local DNS resolution before connecting to the SOCKS proxy, causing queries to blocked domains (like `nyaa.si`) to fail or hang due to ISP DNS poisoning/firewalls. In contrast, `socks5h://` passes the unresolved hostname directly to the SOCKS5 proxy engine (`bypass-engine`) for remote resolution and TLS SNI desynchronization.
+  2. `search_piratebay` (`apibay.org`) frequently hangs with 0 bytes received. Relying on `tokio::join!(pb_future, nyaa_future)` with unbounded timeouts froze the entire search pipeline, keeping Nyaa's instant results (~300ms) hostage and resulting in empty UI results ("No results found.").
+* **Correct Implementation**:
+  - Automatically normalize SOCKS proxy URLs to `socks5h://` and prefer the native SOCKS5 bypass engine on `127.0.0.1:1080`.
+  - Apply strict per-request timeouts (4s for PirateBay, 6s for Nyaa) and stream results incrementally through MPSC channels so Nyaa results display immediately without waiting for slower indexers.
+
+### ❌ 10. NEVER restore stale completed downloads on TUI restart
+* **What went wrong**: Populating `downloads` from `.cache/torrentty/download-history.json` cluttered the TUI on restart with completed items having `0 B` size and `0s` elapsed.
+* **Correct Implementation**: Start every TUI session with a clean downloads state (`Vec::new()`) and wipe stale history on boot.
+* **Logging Requirement**: Always write detailed timestamped execution logs to `~/.cache/torrentty/torrentty.log` for proxy selection, network requests, latencies, and errors.
+
+### ❌ 11. NEVER run BitTorrent downloads without multi-tracker injection (`--bt-tracker`) and stall timeout (`--bt-stop-timeout`)
+* **What went wrong**: In GitHub Actions workflow run 33908880091, direct `.torrent` downloads for Slime S4 Ep 21 stalled at `CN:50 SD:0 DL:0B` indefinitely because:
+  1. The `.torrent` file contained only a single tracker (`nyaa.tracker.wf:7777`) which was unresponsive/rate-limited on GitHub Actions runner IPs.
+  2. `aria2c` lacked additional fallback public trackers because `--bt-tracker` was omitted from `ARIA2_OPTS`.
+  3. `aria2c` had no `--bt-stop-timeout`, causing it to spin at 0 B/s forever without terminating, preventing the magnet fallback step from ever executing.
+  4. Bogus tracker entries like `http://127.0.0.1:8080/announce` in `util.rs` sent tracker announces to the local Python HTTP range server.
+* **Correct Implementation**:
+  - Always inject proven high-speed public UDP and HTTPS trackers (`udp://tracker.opentrackr.org:1337/announce`, `udp://open.stealth.si:80/announce`, `udp://tracker.torrent.eu.org:451/announce`, etc.) via `--bt-tracker="$PUBLIC_TRACKERS"` in `ARIA2_OPTS`.
+  - Set `--bt-stop-timeout=25` on direct `.torrent` downloads so stalls immediately trigger failover to the magnet URI fallback.
+  - Purge any local port (e.g. 127.0.0.1:8080) from tracker announcement lists.
+
 ---
 
 ## 3. Proven High-Performance Configuration Reference
@@ -73,6 +97,8 @@ Future agents **MUST NOT** reintroduce any of the following failed approaches. E
 The following aria2 options in `.github/workflows/cloud_download.yml` are production-proven:
 
 ```bash
+PUBLIC_TRACKERS="udp://tracker.opentrackr.org:1337/announce,udp://open.stealth.si:80/announce,udp://tracker.torrent.eu.org:451/announce,udp://explodie.org:6969/announce,http://nyaa.tracker.wf:7777/announce,https://tracker.pmman.tech:443/announce,https://tracker.nekobt.to/api/tracker/public/announce,https://tracker.nekomi.cn:443/announce,https://tracker.leechshield.link:443/announce,https://tracker.7471.top:443/announce,https://tracker.foreverpirates.co:443/announce"
+
 ARIA2_OPTS=(
   --seed-time=0
   --file-allocation=falloc
@@ -85,6 +111,7 @@ ARIA2_OPTS=(
   --dht-entry-point=dht.transmissionbt.com:6881
   --summary-interval=1
   --enable-peer-exchange=true
+  --bt-tracker="$PUBLIC_TRACKERS"
 )
 ```
 

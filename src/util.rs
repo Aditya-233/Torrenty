@@ -16,7 +16,6 @@ pub fn format_size(bytes: u64) -> String {
 }
 
 pub const DEFAULT_HTTPS_TRACKERS: &[&str] = &[
-    "http://127.0.0.1:8080/announce",
     "http://nyaa.tracker.wf:7777/announce",
     "https://tracker.pmman.tech:443/announce",
     "https://tracker.nekobt.to/api/tracker/public/announce",
@@ -29,7 +28,6 @@ pub const DEFAULT_HTTPS_TRACKERS: &[&str] = &[
 ];
 
 const PRE_ENCODED_TRACKERS: &[&str] = &[
-    "http%3A%2F%2F127.0.0.1%3A8080%2Fannounce",
     "http%3A%2F%2Fnyaa.tracker.wf%3A7777%2Fannounce",
     "https%3A%2F%2Ftracker.pmman.tech%3A443%2Fannounce",
     "https%3A%2F%2Ftracker.nekobt.to%2Fapi%2Ftracker%2Fpublic%2Fannounce",
@@ -84,3 +82,52 @@ pub fn parse_u64<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u64, D::Error
 pub fn parse_u32<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
     parse_u64(d).and_then(|n| u32::try_from(n).map_err(serde::de::Error::custom))
 }
+
+use std::fs::OpenOptions;
+use std::io::Write as IoWrite;
+use std::sync::Mutex;
+
+static LOG_MUTEX: Mutex<()> = Mutex::new(());
+
+pub fn log(level: &str, msg: &str) {
+    let _guard = LOG_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_else(|_| ".".to_string());
+    let dir = std::path::PathBuf::from(home).join(".cache/torrentty");
+    let _ = std::fs::create_dir_all(&dir);
+    let log_file = dir.join("torrentty.log");
+    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(log_file) {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+        let secs = now.as_secs();
+        let millis = now.subsec_millis();
+        let _ = writeln!(f, "[{secs}.{millis:03}] [{level}] {msg}");
+    }
+}
+
+#[macro_export]
+macro_rules! log_info {
+    ($($arg:tt)*) => {
+        $crate::util::log("INFO", &format!($($arg)*))
+    };
+}
+
+#[macro_export]
+macro_rules! log_warn {
+    ($($arg:tt)*) => {
+        $crate::util::log("WARN", &format!($($arg)*))
+    };
+}
+
+#[macro_export]
+macro_rules! log_error {
+    ($($arg:tt)*) => {
+        $crate::util::log("ERROR", &format!($($arg)*))
+    };
+}
+
+#[macro_export]
+macro_rules! log_debug {
+    ($($arg:tt)*) => {
+        $crate::util::log("DEBUG", &format!($($arg)*))
+    };
+}
+

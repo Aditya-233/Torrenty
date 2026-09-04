@@ -22,12 +22,16 @@ pub async fn run() -> Result<()> {
         ..Default::default()
     };
 
-    let session = Session::new_with_opts(download_dir, opts)
+    crate::log_info!("Initializing Torrenty application...");
+    let session = Session::new_with_opts(download_dir.clone(), opts)
         .await
         .map_err(|e| anyhow!("failed to initialize rqbit session: {e}"))?;
+    crate::log_info!("Initialized librqbit session (download_dir: {:?})", download_dir);
 
     let history_path = crate::storage::history_path();
-    let history_entries = crate::storage::load_history(&history_path)?;
+    // Clean up past history file on startup so TUI always starts completely clean without showing past files
+    let _ = std::fs::remove_file(&history_path);
+    let history_entries = Vec::new();
 
     let client = build_client()?;
 
