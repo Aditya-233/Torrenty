@@ -16,7 +16,7 @@ fn is_local_port_open(port: u16) -> bool {
 pub fn build_client() -> Result<Client> {
     let mut builder = Client::builder()
         .user_agent("Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0")
-        .connect_timeout(std::time::Duration::from_secs(4))
+        .connect_timeout(std::time::Duration::from_secs(6))
         .timeout(std::time::Duration::from_secs(10));
 
     let mut proxy_str = None;

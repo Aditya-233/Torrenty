@@ -506,61 +506,49 @@ impl SearchTui {
         let limit = 50;
 
         tokio::spawn(async move {
-            crate::log_info!("Initiating parallel indexer search for '{}'", query_str);
+            crate::log_info!("Initiating synchronized indexer search for '{}'", query_str);
             let client_nyaa = client.clone();
             let query_nyaa = query_str.clone();
             let client_pb = client.clone();
             let query_pb = query_str.clone();
 
-            let (nyaa_tx, mut nyaa_rx) = tokio::sync::mpsc::channel(1);
-            let (pb_tx, mut pb_rx) = tokio::sync::mpsc::channel(1);
-
-            tokio::spawn(async move {
-                let res = crate::indexer::search_nyaa(&client_nyaa, &query_nyaa, limit).await;
-                let _ = nyaa_tx.send(res).await;
-            });
-
-            tokio::spawn(async move {
-                let res = crate::indexer::search_piratebay(&client_pb, &query_pb, limit).await;
-                let _ = pb_tx.send(res).await;
-            });
+            // Run both indexers concurrently and wait for both to complete before publishing
+            let (nyaa_res, pb_res) = tokio::join!(
+                crate::indexer::search_nyaa(&client_nyaa, &query_nyaa, limit),
+                crate::indexer::search_piratebay(&client_pb, &query_pb, limit),
+            );
 
             let mut all_results = Vec::new();
-            let mut nyaa_done = false;
-            let mut pb_done = false;
 
-            while !nyaa_done || !pb_done {
-                tokio::select! {
-                    res = nyaa_rx.recv(), if !nyaa_done => {
-                        nyaa_done = true;
-                        if let Some(Ok(mut r)) = res {
-                            crate::log_info!("Nyaa search completed with {} results; publishing to UI", r.len());
-                            all_results.append(&mut r);
-                            all_results.sort_unstable_by_key(|right| std::cmp::Reverse(right.seeders));
-                            all_results.truncate(limit);
-                            let _ = results_tx.send(Ok(all_results.clone()));
-                        }
-                    }
-                    res = pb_rx.recv(), if !pb_done => {
-                        pb_done = true;
-                        if let Some(Ok(mut r)) = res {
-                            crate::log_info!("PirateBay search completed with {} results", r.len());
-                            if !r.is_empty() {
-                                all_results.append(&mut r);
-                                all_results.sort_unstable_by_key(|right| std::cmp::Reverse(right.seeders));
-                                all_results.truncate(limit);
-                                let _ = results_tx.send(Ok(all_results.clone()));
-                            }
-                        }
-                    }
+            match nyaa_res {
+                Ok(mut r) => {
+                    crate::log_info!("Nyaa search completed with {} results", r.len());
+                    all_results.append(&mut r);
+                }
+                Err(e) => {
+                    crate::log_warn!("Nyaa search failed: {:#}", e);
                 }
             }
+
+            match pb_res {
+                Ok(mut r) => {
+                    crate::log_info!("PirateBay search completed with {} results", r.len());
+                    all_results.append(&mut r);
+                }
+                Err(e) => {
+                    crate::log_warn!("PirateBay search failed: {:#}", e);
+                }
+            }
+
+            all_results.sort_unstable_by_key(|item| std::cmp::Reverse(item.seeders));
+            all_results.truncate(limit);
 
             if all_results.is_empty() {
                 crate::log_warn!("Both indexers completed with 0 total results for '{}'", query_str);
                 let _ = results_tx.send(Ok(Vec::new()));
             } else {
-                crate::log_info!("Search finished with {} total sorted results for '{}'", all_results.len(), query_str);
+                crate::log_info!("Publishing unified sorted search results ({} items) for '{}'", all_results.len(), query_str);
+                let _ = results_tx.send(Ok(all_results));
             }
         });
     }

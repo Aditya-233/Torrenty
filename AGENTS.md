@@ -72,7 +72,8 @@ Future agents **MUST NOT** reintroduce any of the following failed approaches. E
   2. `search_piratebay` (`apibay.org`) frequently hangs with 0 bytes received. Relying on `tokio::join!(pb_future, nyaa_future)` with unbounded timeouts froze the entire search pipeline, keeping Nyaa's instant results (~300ms) hostage and resulting in empty UI results ("No results found.").
 * **Correct Implementation**:
   - Automatically normalize SOCKS proxy URLs to `socks5h://` and prefer the native SOCKS5 bypass engine on `127.0.0.1:1080`.
-  - Apply strict per-request timeouts (4s for PirateBay, 6s for Nyaa) and stream results incrementally through MPSC channels so Nyaa results display immediately without waiting for slower indexers.
+  - Apply strict per-request timeouts (4s for PirateBay, 6s for Nyaa) so neither indexer blocks the other.
+  - Concurrently join both indexers and publish results atomically in a single, unified list sorted by seeders descending to prevent UI list flickering, jumping, and re-sorting beneath user selection.
 
 ### ❌ 10. NEVER restore stale completed downloads on TUI restart
 * **What went wrong**: Populating `downloads` from `.cache/torrentty/download-history.json` cluttered the TUI on restart with completed items having `0 B` size and `0s` elapsed.
