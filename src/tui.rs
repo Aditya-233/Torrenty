@@ -834,7 +834,7 @@ impl DownloadSession {
                     let tag_c = tag.clone();
                     move || {
                         std::process::Command::new("gh")
-                            .args(["release", "view", &tag_c, "--repo", "Aditya-233/Torrenty", "--json", "assets"])
+                            .args(["release", "view", &tag_c, "--repo", "Aditya-233/Torrenty", "--json", "assets,body"])
                             .output()
                     }
                 }).await.ok().and_then(|r| r.ok());
@@ -842,16 +842,33 @@ impl DownloadSession {
                 if let Some(out) = poll_res {
                     if out.status.success() {
                         if let Ok(json_val) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
-                            if let Some(assets) = json_val.get("assets").and_then(|a| a.as_array()) {
-                                if let Some(asset) = assets.iter().find(|a| a.get("size").and_then(|s| s.as_u64()).unwrap_or(0) > 1024) {
-                                    if let Some(url) = asset.get("url").and_then(|u| u.as_str()) {
-                                        download_url = Some(url.to_string());
-                                        if let Some(sz) = asset.get("size").and_then(|s| s.as_u64()) {
-                                            expected_size = sz;
+                            if let Some(body) = json_val.get("body").and_then(|b| b.as_str()) {
+                                for line in body.lines() {
+                                    if let Some(rest) = line.strip_prefix("STREAM_URL:") {
+                                        let u = rest.trim();
+                                        if u.starts_with("https://") {
+                                            download_url = Some(u.to_string());
+                                            break;
                                         }
-                                        break;
                                     }
                                 }
+                            }
+
+                            if download_url.is_none() {
+                                if let Some(assets) = json_val.get("assets").and_then(|a| a.as_array()) {
+                                    if let Some(asset) = assets.iter().find(|a| a.get("size").and_then(|s| s.as_u64()).unwrap_or(0) > 1024) {
+                                        if let Some(url) = asset.get("url").and_then(|u| u.as_str()) {
+                                            download_url = Some(url.to_string());
+                                            if let Some(sz) = asset.get("size").and_then(|s| s.as_u64()) {
+                                                expected_size = sz;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            if download_url.is_some() {
+                                break;
                             }
                         }
                     }

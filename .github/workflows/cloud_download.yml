@@ -25,16 +25,26 @@ jobs:
     name: Fast Cloud Download
     runs-on: ubuntu-latest
     steps:
-      - name: Fast Install aria2
+      - name: Fast Zero-Install Tooling
         run: |
-          sudo apt-get install -y --no-install-recommends aria2 || (sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends aria2)
+          echo "Installing cloud accelerator tools in parallel..."
+          sudo curl -sLo /usr/local/bin/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 && sudo chmod +x /usr/local/bin/cloudflared &
+          sudo apt-get install -y --no-install-recommends aria2 >/dev/null 2>&1 &
+          wait
+          echo "Tooling ready: aria2, cloudflared"
 
-      - name: Extreme Accelerated Torrent Download
+      - name: Extreme Accelerated Torrent Download & Stream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Use RAM-disk (/dev/shm) for zero disk I/O latency
+          # Use RAM-disk (/dev/shm) for zero disk I/O latency (Strategy 6)
           mkdir -p /dev/shm/dl
           cd /dev/shm/dl
           echo "Starting extreme accelerated download for ${{ inputs.name }}..."
+
+          # Launch local HTTP server and Cloudflare Quick Tunnel in background (Strategy 3)
+          python3 -m http.server 8080 --directory /dev/shm/dl >/dev/null 2>&1 &
+          cloudflared tunnel --url http://127.0.0.1:8080 > /dev/shm/tunnel.log 2>&1 &
 
           ARIA2_OPTS=(
             --seed-time=0
@@ -49,16 +59,17 @@ jobs:
             --summary-interval=2
             --bt-stop-timeout=120
             --enable-peer-exchange=true
+            --bt-prioritize-piece=head,tail
           )
 
           TORRENT_URL="${{ inputs.torrent_url }}"
           if [ -n "$TORRENT_URL" ]; then
-            echo "Direct .torrent download with high-speed peer flags..."
+            echo "Direct .torrent download with tuned peer flags..."
             aria2c "${ARIA2_OPTS[@]}" "$TORRENT_URL" || true
           fi
 
           # If media file not yet obtained, fallback to magnet
-          MEDIA_COUNT=$(find /dev/shm/dl -maxdepth 1 -type f ! -name "*.torrent" | wc -l)
+          MEDIA_COUNT=$(find /dev/shm/dl -maxdepth 2 -type f ! -name "*.torrent" ! -name "*.dat" | wc -l)
           if [ "$MEDIA_COUNT" -eq 0 ]; then
             echo "Fallback to magnet URI with full tracker swarm..."
             aria2c "${ARIA2_OPTS[@]}" "${{ inputs.magnet }}"
@@ -67,30 +78,51 @@ jobs:
           echo "Downloaded files in RAM disk:"
           ls -lh /dev/shm/dl
 
-      - name: Upload to Release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          TAG="${{ inputs.tag }}"
-          REPO="Aditya-233/Torrenty"
-          gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1 || gh release create "$TAG" --repo "$REPO" --title "Torrent Cloud Downloads" --notes "Automated cloud torrent downloads for bypass users" || true
-          cd /dev/shm/dl
-          
-          # Remove .torrent files so only clean video payload is uploaded
+          # Clean up names
           rm -f *.torrent
-
+          TARGET_FILE=""
           for f in *; do
             if [ -f "$f" ]; then
               clean_name="$(echo "$f" | sed 's/[][()]/_/g' | tr ' ' '_')"
               if [ "$clean_name" != "$f" ]; then
                 mv "$f" "$clean_name"
               fi
-              echo "Fast uploading $clean_name..."
-              gh release upload "$TAG" "$clean_name" --repo "$REPO" --clobber
-            elif [ -d "$f" ]; then
-              clean_name="$(echo "$f" | sed 's/[][()]/_/g' | tr ' ' '_').tar"
-              tar -cf "$clean_name" "$f"
-              echo "Uploading directory archive $clean_name..."
-              gh release upload "$TAG" "$clean_name" --repo "$REPO" --clobber
+              TARGET_FILE="$clean_name"
+              break
             fi
+          done
+
+          TAG="${{ inputs.tag }}"
+          REPO="Aditya-233/Torrenty"
+
+          # Extract Cloudflare tunnel URL
+          TUNNEL_URL=""
+          for i in {1..10}; do
+            TUNNEL_URL=$(grep -oE "https://[a-zA-Z0-9-]+\.trycloudflare\.com" /dev/shm/tunnel.log | head -n 1 || true)
+            if [ -n "$TUNNEL_URL" ]; then
+              break
+            fi
+            sleep 1
+          done
+
+          if [ -n "$TUNNEL_URL" ] && [ -n "$TARGET_FILE" ]; then
+            STREAM_NOTE="STREAM_URL: $TUNNEL_URL/$TARGET_FILE"
+            echo "Instant Stream URL available: $STREAM_NOTE"
+            gh release edit "$TAG" --repo "$REPO" --notes "$STREAM_NOTE" 2>/dev/null || gh release create "$TAG" --repo "$REPO" --title "Torrent Cloud Downloads" --notes "$STREAM_NOTE" || true
+          else
+            echo "Tunnel URL not found, falling back to release upload..."
+            gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1 || gh release create "$TAG" --repo "$REPO" --title "Torrent Cloud Downloads" --notes "Release fallback" || true
+          fi
+
+          # Background release upload as fallback
+          if [ -n "$TARGET_FILE" ]; then
+            echo "Starting background GitHub release upload fallback..."
+            gh release upload "$TAG" "$TARGET_FILE" --repo "$REPO" --clobber >/dev/null 2>&1 &
+          fi
+
+          # Keep runner alive for client streaming
+          echo "Holding runner stream pipe alive for client streaming..."
+          for i in {1..20}; do
+            sleep 30
+            echo "Streaming alive: $((i * 30))s elapsed"
           done
