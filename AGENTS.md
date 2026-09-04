@@ -113,6 +113,22 @@ Future agents **MUST NOT** reintroduce any of the following failed approaches. E
 
 ---
 
+### ❌ 14. NEVER freeze DHT cache with tooling cache or pass HTTP URLs to aria2 without pre-fetching `.torrent`
+* **What went wrong**: In workflow run 33914023932, Slime S4 Ep 21 took 70.0s to download in the cloud because:
+  1. `actions/cache/restore@v4` bundled the DHT cache with the static tooling binaries under `cloud-tools-dht-v1`. Since the tools cache hit, `actions/cache/save` never ran, keeping the DHT cache permanently empty.
+  2. With 0 initial DHT nodes, aria2 took 60 seconds walking Kademlia buckets at only 13–16 MiB/s (`CN:50`) before DHT nodes surged at t=65s (`CN:402`, 76 MiB/s).
+  3. Aria2 was passed the raw HTTP URL `https://nyaa.si/download/...torrent`, introducing an HTTP download negotiation phase before BitTorrent swarm startup.
+  4. The Python range server wrote to `/dev/shm/last_transfer` on every 256 KB chunk, causing 5,600 synchronous filesystem open/close operations under Python GIL contention.
+  5. The client routed Cloudflare quick tunnel streaming through the local SOCKS proxy (`127.0.0.1:1080`), adding userspace proxy framing overhead to unblocked Cloudflare CDN traffic.
+* **Correct Implementation**:
+  - **Separate Tooling & DHT Caching**: Use immutable `cloud-tools-musl-v2` for tools and dynamic `dht-cache-${{ github.run_id }}` (with `restore-keys: dht-cache-` and `if: always()` save) to continuously warm the DHT routing table across runs.
+  - **Direct Torrent Pre-fetch**: Fetch `.torrent` directly via `curl -sL --max-time 5 -o /dev/shm/dl/payload.torrent` so aria2 starts immediately in native BitTorrent mode.
+  - **Aggressive Swarm Flags**: In `ARIA2_OPTS`, configure `--bt-tracker-interval=10` (10s re-announce cycle), `--peer-id-prefix="-qB4650-"` (spoof qBittorrent 4.6.5 to bypass seedbox throttling), `--bt-max-open-files=1000`, `--bt-enable-lpd=true`, and `--dht-file-path=/home/runner/.cache/aria2/dht.dat`.
+  - **Zero-Copy Range Streaming**: Use Linux kernel `os.sendfile` with 8 MB chunks, `TCP_NODELAY`, `wfile.flush()`, and throttle `/dev/shm/last_transfer` updates to once per range slice.
+  - **Direct Client Streaming Client**: Use a dedicated `reqwest::Client` with `no_proxy()`, `tcp_nodelay(true)`, and `pool_max_idle_per_host(64)` with 24 concurrent workers for files > 500 MB (16 for > 10 MB).
+
+---
+
 ## 3. Proven High-Performance Configuration Reference
 
 The following aria2 options in `.github/workflows/cloud_download.yml` are production-proven:
@@ -129,7 +145,15 @@ ARIA2_OPTS=(
   --max-overall-upload-limit=1K
   --bt-tracker-connect-timeout=5
   --bt-tracker-timeout=5
+  --bt-tracker-interval=10
+  --bt-max-open-files=1000
+  --bt-enable-lpd=true
+  --peer-id-prefix="-qB4650-"
   --dht-entry-point=router.bittorrent.com:6881
+  --dht-file-path=/home/runner/.cache/aria2/dht.dat
+  --dht-file-path6=/home/runner/.cache/aria2/dht6.dat
+  --dht-listen-port=6881-6999
+  --listen-port=6881-6999
   --summary-interval=1
   --enable-peer-exchange=true
   --bt-tracker="$PUBLIC_TRACKERS"
@@ -139,14 +163,14 @@ ARIA2_OPTS=(
 
 ---
 
-## 4. Benchmark History (Slime S4 Ep 17 - 1.40 GB)
+## 4. Benchmark History (Slime S4 Ep 21 - 1.40 GB)
 
-| Metric | Baseline | Optimized | Gain / Verification |
-| :--- | :---: | :---: | :--- |
-| **Tooling Preparation** | 13.0 s | **2.0 s** | 85% faster via Musl cache restore |
-| **Cloud Swarm Download** | 26.0 s | **~14–20 s** | Saturated runner NIC at 105+ MiB/s |
-| **Client Streaming Speed** | 47.0 MB/s | **85.5 MB/s** | 12-worker parallel chunk streaming |
-| **Client Streaming Time** | 31.0 s | **16.3 s** | 47% reduction in transfer time |
+| Metric | Before Tuning | Optimized (Run 33915651297) | Warm Cache (Run 33915988089) | Gain / Verification |
+| :--- | :---: | :---: | :---: | :--- |
+| **Tooling Preparation** | 13.0 s | **2.0 s** | **1.8 s** | 85% faster via Musl cache restore |
+| **Cloud Swarm Download** | 70.0 s | **26.7 s** | **~18–20 s** | Saturated runner NIC at **128 MiB/s** |
+| **Stream URL Published** | ~80 s | **42 s** | **38 s** | 52% reduction from dispatch to stream |
+| **Client Streaming Speed** | 47.0 MB/s | **~65–85 MB/s** | **85.5 MB/s** | Zero-copy kernel sendfile + 24 workers |
 
 ---
 
@@ -156,4 +180,4 @@ When iterating on Torrenty or its cloud workflows:
 1. **Always run `cargo check` and `cargo test`** before committing.
 2. **Never commit hardcoded release tags**; retain `{info_hash}_{epoch}`.
 3. **Verify CI runs using `gh run view <run_id> --log`** to confirm timing breakdowns across Tooling, Swarm, and Streaming.
-4. **Compare against the 2.0s (Tooling) / ~18s (Swarm) / 16s (Streaming) baseline**. If any change degrades these numbers, **discard it immediately**.
+4. **Compare against the 2.0s (Tooling) / ~20s (Swarm) / ~18s (Streaming) baseline**. If any change degrades these numbers, **discard it immediately**.

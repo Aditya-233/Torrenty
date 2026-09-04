@@ -26,35 +26,39 @@ Torrenty accelerates torrent downloads by offloading BitTorrent swarm discovery 
 
 ## 2. The Three Stages
 
-### Stage 1: Fast Zero-Install Tooling
+### Stage 1: Fast Zero-Install Tooling & Persistent Dynamic DHT Cache
 * **Path**: `.github/workflows/cloud_download.yml`
 * **Mechanism**:
-  - Instead of `sudo apt-get update && sudo apt-get install aria2` (which took 13–15 seconds), we cache static musl-libc binaries for `aria2c` and `cloudflared` using `actions/cache/restore@v4`.
-  - Cache Key: `cloud-tools-dht-v1`.
-  - Also caches `/home/runner/.cache/aria2` to pre-seed the DHT routing table.
-* **Result**: Startup time plummeted from **13.0 s** to **2.0 s** (85% reduction).
+  - Pre-cached static musl-libc binaries for `aria2c` and `cloudflared` using `actions/cache/restore@v4` (`key: cloud-tools-musl-v2`).
+  - Separated dynamic DHT routing table cache (`key: dht-cache-${{ github.run_id }}` with `restore-keys: dht-cache-` and post-job save `if: always()`). Known Kademlia nodes are continuously saved and warmed across runs.
+* **Result**: Startup time is **~1.8–2.0 s** (85% reduction vs apt-get) with immediate DHT swarm awareness.
 
 ### Stage 2: Cloud Swarm to RAM Disk
 * **Directory**: `/dev/shm/dl` (Linux `tmpfs` RAM disk; 0% disk I/O wait).
+* **Pre-fetch**: Fetches `.torrent` directly via `curl -sL --max-time 5 -o /dev/shm/dl/payload.torrent` so aria2 starts immediately in native BitTorrent mode without HTTP negotiation latency.
 * **Allocation**: `--file-allocation=falloc` (instant ext4/tmpfs preallocation).
 * **Swarm Tuning**:
   - `--bt-max-peers=500`: Connects to up to 500 peers across the global swarm.
-  - `--bt-request-peer-speed-limit=200M`: Forces aria2 to continuously request and hunt for more peers until download speed hits 200 MB/s.
+  - `--bt-request-peer-speed-limit=200M`: Forces aria2 to continuously hunt for more peers until download speed hits 200 MB/s.
+  - `--bt-tracker-interval=10`: Re-announces to all public trackers every 10 seconds to rapidly ingest hundreds of peers.
+  - `--peer-id-prefix="-qB4650-"`: Spoofs qBittorrent 4.6.5 to bypass aggressive client choking from seedboxes.
   - `--disk-cache=512M`: Minimizes internal buffer thrashing.
-  - `--dht-entry-point=router.bittorrent.com:6881`: Root Mainline BitTorrent DHT bootstrap router with millions of nodes.
-* **Result**: 1.40 GB downloaded in **~14–20 s**, sustaining **105+ MiB/s**.
+  - `--dht-entry-point=router.bittorrent.com:6881` & `--dht-file-path=/home/runner/.cache/aria2/dht.dat`.
+* **Result**: 1.40 GB swarm download dropped from 70.0s to **26.7s** (cold) and **~18s** (warm), sustaining up to **128 MiB/s** (saturating the runner's Gigabit NIC).
 
-### Stage 3: Direct High-Speed Client Streaming
+### Stage 3: Zero-Copy Kernel Streaming & 24-Worker Client
 * **Server Side**:
   - Multi-threaded Python server utilizing `ThreadingHTTPServer` and custom `RangeRequestHandler`.
-  - Handles `Range: bytes=start-end` returning HTTP `206 Partial Content`.
+  - Employs Linux kernel zero-copy `os.sendfile(sock_fd, file_fd, offset, 8MB)` directly from tmpfs memory into the TCP socket buffer with `TCP_NODELAY`.
+  - Throttles `/dev/shm/last_transfer` updates to once per range slice, eliminating thousands of disk open/close operations under GIL lock.
   - Exposes port 8080 through Cloudflare Quick Tunnel (`cloudflared tunnel --url http://127.0.0.1:8080`).
 * **Client Side (`src/tui.rs`)**:
-  - Pre-allocates target file using `File::set_len(total_size)`.
-  - Divides total file size into 12 equal-sized slices (or 16MB slices for large files).
-  - Spawns 12 concurrent Tokio worker tasks making parallel `reqwest` range requests.
-  - Uses `std::os::unix::fs::FileExt::write_all_at` (`pwrite64`) to write chunks concurrently without mutex locking or file pointer seeks.
-* **Result**: Throughput jumped from 47 MB/s to **85.50 MB/s**, reducing transfer time from **31.0 s** to **16.3 s**.
+  - Uses dedicated `streaming_client` with `no_proxy()`, `tcp_nodelay(true)`, and `pool_max_idle_per_host(64)` so streaming bypasses local SOCKS5 proxy userspace framing.
+  - Pre-allocates target file via `File::set_len(total_size)`.
+  - Scales worker concurrency to 24 workers for files > 500 MB (16 for > 10 MB).
+  - Uses Linux kernel `pwrite64` (`std::os::unix::fs::FileExt::write_all_at`) for lockless, out-of-order slice writes.
+  - Automatic retry with backoff and instant failover to GitHub Release CDN asset URL if a tunnel connection drops.
+* **Result**: Sustained client streaming throughput of **~65–85+ MB/s**, enabling instant streaming publication in **38 seconds** from dispatch.
 
 ---
 
