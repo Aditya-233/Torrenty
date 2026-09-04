@@ -38,5 +38,6 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${{ inputs.tag }}"
-          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "Torrent Cloud Downloads" --notes "Automated cloud torrent downloads for bypass users"
-          find /tmp/dl -type f -exec gh release upload "$TAG" {} --clobber \;
+          REPO="Aditya-233/Torrenty"
+          gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1 || gh release create "$TAG" --repo "$REPO" --title "Torrent Cloud Downloads" --notes "Automated cloud torrent downloads for bypass users"
+          find /tmp/dl -type f -exec gh release upload "$TAG" {} --repo "$REPO" --clobber \;
