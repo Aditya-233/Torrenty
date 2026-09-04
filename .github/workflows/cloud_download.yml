@@ -45,7 +45,7 @@ jobs:
             --max-overall-upload-limit=1K
             --bt-tracker-connect-timeout=2
             --bt-tracker-timeout=2
-            --dht-entry-point=dht.transmissionbt.com:6881,router.bittorrent.com:6881,router.utorrent.com:6881
+            --dht-entry-point=dht.transmissionbt.com:6881
             --summary-interval=2
             --bt-stop-timeout=120
             --enable-peer-exchange=true
