@@ -40,4 +40,14 @@ jobs:
           TAG="${{ inputs.tag }}"
           REPO="Aditya-233/Torrenty"
           gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1 || gh release create "$TAG" --repo "$REPO" --title "Torrent Cloud Downloads" --notes "Automated cloud torrent downloads for bypass users"
-          find /tmp/dl -type f -exec gh release upload "$TAG" {} --repo "$REPO" --clobber \;
+          cd /tmp/dl
+          for f in *; do
+            if [ -f "$f" ]; then
+              clean_name="$(echo "$f" | sed 's/[][()]/_/g' | tr ' ' '_')"
+              if [ "$clean_name" != "$f" ]; then
+                mv "$f" "$clean_name"
+              fi
+              echo "Uploading $clean_name..."
+              gh release upload "$TAG" "$clean_name" --repo "$REPO" --clobber
+            fi
+          done
