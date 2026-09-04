@@ -1,0 +1,42 @@
+name: Cloud Torrent Download
+
+on:
+  workflow_dispatch:
+    inputs:
+      magnet:
+        description: 'Magnet URI or InfoHash'
+        required: true
+      name:
+        description: 'Torrent file or item name'
+        required: true
+      tag:
+        description: 'Release tag to upload to'
+        default: 'proof'
+
+permissions:
+  contents: write
+
+jobs:
+  download:
+    name: Fast Cloud Download
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install aria2
+        run: sudo apt-get update && sudo apt-get install -y aria2
+
+      - name: Download torrent via aria2
+        run: |
+          mkdir -p /tmp/dl
+          cd /tmp/dl
+          echo "Starting aria2 download for ${{ inputs.name }}..."
+          aria2c --seed-time=0 --max-connection-per-server=16 --split=16 --bt-stop-timeout=300 --summary-interval=5 "${{ inputs.magnet }}"
+          echo "Downloaded files:"
+          ls -lh /tmp/dl
+
+      - name: Upload to Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ inputs.tag }}"
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "Torrent Cloud Downloads" --notes "Automated cloud torrent downloads for bypass users"
+          find /tmp/dl -type f -exec gh release upload "$TAG" {} --clobber \;
