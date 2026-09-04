@@ -25,17 +25,14 @@ jobs:
     name: Fast Cloud Download
     runs-on: ubuntu-latest
     steps:
-      - name: Restore Accelerator Tools & DHT Cache
+      - name: Restore Tools Cache
         uses: actions/cache/restore@v4
         id: cache-tools
         with:
           path: |
             /usr/local/bin/aria2c
             /usr/local/bin/cloudflared
-            /home/runner/.cache/aria2
-          key: cloud-tools-dht-v1
-          restore-keys: |
-            cloud-tools-dht-
+          key: cloud-tools-musl-v2
 
       - name: Fast Zero-Install Tooling
         if: steps.cache-tools.outputs.cache-hit != 'true'
@@ -46,15 +43,22 @@ jobs:
           wait
           echo "Tooling ready: aria2, cloudflared"
 
-      - name: Save Accelerator Tools & DHT Cache
+      - name: Save Tools Cache
         if: steps.cache-tools.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: |
             /usr/local/bin/aria2c
             /usr/local/bin/cloudflared
-            /home/runner/.cache/aria2
-          key: cloud-tools-dht-v1
+          key: cloud-tools-musl-v2
+
+      - name: Restore DHT Routing Table
+        uses: actions/cache/restore@v4
+        with:
+          path: /home/runner/.cache/aria2
+          key: dht-cache-${{ github.run_id }}
+          restore-keys: |
+            dht-cache-
 
       - name: Extreme Accelerated Torrent Download & Stream
         env:
@@ -66,9 +70,9 @@ jobs:
           cd /dev/shm/dl
           echo "Starting extreme accelerated download for ${{ inputs.name }}..."
 
-          # Launch Python Multi-Threaded Range Server (RFC-7233) for 12x parallel client streaming
+          # Launch Python Multi-Threaded Range Server (RFC-7233) with zero-copy sendfile
           python3 -c "
-          import os, functools, time
+          import os, functools, time, socket
           from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 
           class RangeRequestHandler(SimpleHTTPRequestHandler):
@@ -99,17 +103,32 @@ jobs:
                           self.send_header('Accept-Ranges', 'bytes')
                           self.send_header('Connection', 'keep-alive')
                           self.end_headers()
-                          f.seek(start)
+                          self.wfile.flush()
+
+                          try:
+                              self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                          except Exception:
+                              pass
+
                           to_send = end - start + 1
-                          buf_size = 256 * 1024
+                          sock_fd = self.connection.fileno()
+                          file_fd = f.fileno()
+                          offset = start
+                          chunk_size = 8 * 1024 * 1024
                           while to_send > 0:
-                              chunk = f.read(min(buf_size, to_send))
-                              if not chunk:
+                              batch = min(chunk_size, to_send)
+                              sent = os.sendfile(sock_fd, file_fd, offset, batch)
+                              if sent <= 0:
                                   break
-                              self.wfile.write(chunk)
-                              to_send -= len(chunk)
+                              offset += sent
+                              to_send -= sent
+
+                          try:
                               with open('/dev/shm/last_transfer', 'w') as tf:
                                   tf.write(str(time.time()))
+                          except Exception:
+                              pass
+
                           f.close()
                           return None
                   except Exception:
@@ -133,7 +152,15 @@ jobs:
             --max-overall-upload-limit=1K
             --bt-tracker-connect-timeout=5
             --bt-tracker-timeout=5
+            --bt-tracker-interval=10
+            --bt-max-open-files=1000
+            --bt-enable-lpd=true
+            --peer-id-prefix="-qB4650-"
             --dht-entry-point=router.bittorrent.com:6881
+            --dht-file-path=/home/runner/.cache/aria2/dht.dat
+            --dht-file-path6=/home/runner/.cache/aria2/dht6.dat
+            --dht-listen-port=6881-6999
+            --listen-port=6881-6999
             --summary-interval=1
             --enable-peer-exchange=true
             --bt-tracker="$PUBLIC_TRACKERS"
@@ -142,8 +169,15 @@ jobs:
 
           TORRENT_URL="${{ inputs.torrent_url }}"
           if [ -n "$TORRENT_URL" ]; then
-            echo "Direct .torrent download with tuned peer flags..."
-            aria2c "${ARIA2_OPTS[@]}" --bt-stop-timeout=25 "$TORRENT_URL" || true
+            echo "Pre-fetching .torrent file..."
+            curl -sL --max-time 5 -o /dev/shm/dl/payload.torrent "$TORRENT_URL" || true
+            if [ -s /dev/shm/dl/payload.torrent ]; then
+              echo "Direct .torrent download with tuned peer flags..."
+              aria2c "${ARIA2_OPTS[@]}" --bt-stop-timeout=25 /dev/shm/dl/payload.torrent || true
+            else
+              echo "Direct .torrent fetch failed or empty; downloading via URI..."
+              aria2c "${ARIA2_OPTS[@]}" --bt-stop-timeout=25 "$TORRENT_URL" || true
+            fi
           fi
 
           # If media file not yet obtained, fallback to magnet
@@ -266,3 +300,11 @@ jobs:
             wait $UPLOAD_PID 2>/dev/null || true
           fi
           echo "Upload and stream session complete."
+
+      - name: Save DHT Routing Table
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: /home/runner/.cache/aria2
+          key: dht-cache-${{ github.run_id }}
+

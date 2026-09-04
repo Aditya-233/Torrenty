@@ -891,7 +891,15 @@ impl DownloadSession {
 
         let _ = download_tx.send((info_hash_str.clone(), DownloadEvent::Status("Streaming verified data over HTTPS...".to_string())));
 
-        let probe_resp = client.get(&url)
+        // Create dedicated streaming client bypassing local SOCKS proxies with TCP_NODELAY and connection pooling
+        let streaming_client = reqwest::Client::builder()
+            .no_proxy()
+            .tcp_nodelay(true)
+            .pool_max_idle_per_host(64)
+            .build()
+            .unwrap_or_else(|_| client.clone());
+
+        let probe_resp = streaming_client.get(&url)
             .timeout(Duration::from_secs(15))
             .header("Range", "bytes=0-0")
             .send()
@@ -919,7 +927,13 @@ impl DownloadSession {
         }
         drop(file);
 
-        let num_workers: usize = if supports_range && total_bytes > 10_000_000 { 12 } else { 1 };
+        let num_workers: usize = if supports_range && total_bytes > 500_000_000 {
+            24
+        } else if supports_range && total_bytes > 10_000_000 {
+            16
+        } else {
+            1
+        };
         let chunk_size = (total_bytes + num_workers as u64 - 1) / num_workers as u64;
         let downloaded = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
@@ -963,7 +977,7 @@ impl DownloadSession {
                 if start > end {
                     continue;
                 }
-                let client = client.clone();
+                let client = streaming_client.clone();
                 let primary_url = url.clone();
                 let backup_url = backup_url.clone();
                 let target_path = target_path.clone();
@@ -1040,6 +1054,7 @@ impl DownloadSession {
             let mut current_offset = 0;
             let mut attempts = 0;
             let mut use_backup = false;
+            let client = streaming_client.clone();
 
             while current_offset < total_bytes && attempts < 25 {
                 attempts += 1;
