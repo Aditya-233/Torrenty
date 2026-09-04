@@ -254,7 +254,26 @@ impl SearchTui {
             let seeders_str = download.torrent.seeders.to_string();
             let size_str = crate::util::format_size(download.torrent.size_bytes);
             let elapsed = download.elapsed_time();
-            let info_paragraph = Paragraph::new(vec![Line::from(vec![Span::styled("Torrent ", Style::default().fg(OVERLAY0)), Span::styled(download.torrent.name.as_str(), Style::default().fg(TEXT))]), Line::default(), Line::from(vec![Span::styled("Size    ", Style::default().fg(OVERLAY0)), Span::styled(size_str, Style::default().fg(SKY)), Span::raw("  "), Span::styled("Seeders ", Style::default().fg(OVERLAY0)), Span::styled(seeders_str, Style::default().fg(YELLOW)), Span::raw("  "), Span::styled("Elapsed ", Style::default().fg(OVERLAY0)), Span::styled(elapsed, Style::default().fg(TEXT))])]);
+            let info_paragraph = Paragraph::new(vec![
+                Line::from(vec![
+                    Span::styled("Torrent ", Style::default().fg(OVERLAY0)),
+                    Span::styled(download.torrent.name.as_str(), Style::default().fg(TEXT)),
+                ]),
+                Line::from(vec![
+                    Span::styled("Path    ", Style::default().fg(OVERLAY0)),
+                    Span::styled(download.target_path.display().to_string(), Style::default().fg(GREEN)),
+                ]),
+                Line::from(vec![
+                    Span::styled("Size    ", Style::default().fg(OVERLAY0)),
+                    Span::styled(size_str, Style::default().fg(SKY)),
+                    Span::raw("  "),
+                    Span::styled("Seeders ", Style::default().fg(OVERLAY0)),
+                    Span::styled(seeders_str, Style::default().fg(YELLOW)),
+                    Span::raw("  "),
+                    Span::styled("Elapsed ", Style::default().fg(OVERLAY0)),
+                    Span::styled(elapsed, Style::default().fg(TEXT)),
+                ]),
+            ]);
             frame.render_widget(info_paragraph, right_chunks[0]);
 
             let progress_chunks = Layout::horizontal([Constraint::Length(17), Constraint::Length(24), Constraint::Min(0)]).split(right_chunks[1]);
@@ -520,7 +539,7 @@ impl DownloadSession {
         download_tx: tokio::sync::mpsc::UnboundedSender<(String, DownloadEvent)>,
         client: reqwest::Client,
     ) -> Self {
-        let target_path = PathBuf::from(".").join(&torrent.name);
+        let target_path = crate::storage::default_download_dir().join(&torrent.name);
 
         let torrent_clone = torrent.clone();
         tokio::runtime::Handle::current().spawn(Self::download_task(session, torrent_clone, download_tx, client));
@@ -635,7 +654,7 @@ impl DownloadSession {
                     let name_c = torrent.name.clone();
                     let magnet_c = torrent.resolved_magnet();
                     let torrent_url_c = torrent.torrent_url.clone();
-                    let target_path = PathBuf::from(".").join(&torrent.name);
+                    let target_path = crate::storage::default_download_dir().join(&torrent.name);
                     let download_tx_c = download_tx.clone();
                     let total_size = torrent.size_bytes;
 

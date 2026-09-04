@@ -3,11 +3,10 @@ use crate::tui::run_search_tui;
 use anyhow::{anyhow, Result};
 use librqbit::Session;
 use std::collections::HashSet;
-use std::path::PathBuf;
 
 /// Runs the application, initializing session and running the TUI.
 pub async fn run() -> Result<()> {
-    let download_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let download_dir = crate::storage::default_download_dir();
 
     let default_trackers: HashSet<url::Url> = crate::util::DEFAULT_HTTPS_TRACKERS
         .iter()

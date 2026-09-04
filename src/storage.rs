@@ -14,6 +14,17 @@ pub struct DownloadHistoryEntry {
 }
 
 #[must_use]
+pub fn default_download_dir() -> PathBuf {
+    if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+        let dl = PathBuf::from(home).join("Downloads");
+        if dl.is_dir() {
+            return dl;
+        }
+    }
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+#[must_use]
 pub fn history_path() -> PathBuf {
     let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_default();
     PathBuf::from(home).join(".cache/torrentty/download-history.json")
