@@ -111,21 +111,16 @@ jobs:
           ARIA2_OPTS=(
             --seed-time=0
             --file-allocation=falloc
-            --bt-max-peers=0
-            --bt-request-peer-speed-limit=0
+            --bt-max-peers=250
+            --bt-request-peer-speed-limit=100M
             --disk-cache=512M
             --max-overall-upload-limit=1K
-            --bt-tracker-connect-timeout=2
-            --bt-tracker-timeout=2
+            --bt-tracker-connect-timeout=3
+            --bt-tracker-timeout=3
             --dht-entry-point=dht.transmissionbt.com:6881
             --summary-interval=1
             --enable-peer-exchange=true
             --bt-prioritize-piece=head,tail
-            --max-connection-per-server=16
-            --split=64
-            --min-split-size=1M
-            --event-poll=epoll
-            --bt-min-crypto-level=plain
           )
 
           TORRENT_URL="${{ inputs.torrent_url }}"
