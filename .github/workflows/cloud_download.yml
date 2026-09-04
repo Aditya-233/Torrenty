@@ -53,14 +53,12 @@ jobs:
             --bt-request-peer-speed-limit=100M
             --disk-cache=512M
             --max-overall-upload-limit=1K
-            --bt-tracker-connect-timeout=5
-            --bt-tracker-timeout=5
+            --bt-tracker-connect-timeout=3
+            --bt-tracker-timeout=3
             --dht-entry-point=dht.transmissionbt.com:6881
             --summary-interval=2
             --enable-peer-exchange=true
             --bt-prioritize-piece=head,tail
-            --enable-dht6=false
-            --peer-id-prefix="-qB4520-"
           )
 
           TORRENT_URL="${{ inputs.torrent_url }}"
@@ -125,15 +123,14 @@ jobs:
             gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1 || gh release create "$TAG" --repo "$REPO" --title "Torrent Cloud Downloads" --notes "Release fallback" || true
           fi
 
-          # Background release upload as fallback
+          # Upload to GitHub Release as permanent backup while client streams via tunnel
           if [ -n "$TARGET_FILE" ]; then
-            echo "Starting background GitHub release upload fallback..."
-            gh release upload "$TAG" "$TARGET_FILE" --repo "$REPO" --clobber >/dev/null 2>&1 &
+            echo "Starting GitHub release backup upload in background..."
+            gh release upload "$TAG" "$TARGET_FILE" --repo "$REPO" --clobber &
+            UPLOAD_PID=$!
+            echo "Holding stream tunnel alive during release upload..."
+            wait $UPLOAD_PID 2>/dev/null || sleep 90
+            echo "Upload and stream session complete."
+          else
+            sleep 60
           fi
-
-          # Keep runner alive for client streaming
-          echo "Holding runner stream pipe alive for client streaming..."
-          for i in {1..20}; do
-            sleep 30
-            echo "Streaming alive: $((i * 30))s elapsed"
-          done
