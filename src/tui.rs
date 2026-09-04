@@ -758,44 +758,16 @@ impl DownloadSession {
         total_size: u64,
         download_tx: &tokio::sync::mpsc::UnboundedSender<(String, DownloadEvent)>,
     ) -> Result<()> {
-        let tag = format!("dl_{}", &info_hash[..12.min(info_hash.len())]);
+        let tag = format!("dl_{}_{}", &info_hash[..8.min(info_hash.len())], std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs());
         let info_hash_str = info_hash.to_string();
 
         let _ = download_tx.send((info_hash_str.clone(), DownloadEvent::Status("DPI detected. Activating Cloud Accelerator...".to_string())));
 
-        // 1. Check if asset already exists in release
-        let check_existing = tokio::task::spawn_blocking({
-            let tag_c = tag.clone();
-            move || {
-                std::process::Command::new("gh")
-                    .args(["release", "view", &tag_c, "--repo", "Aditya-233/Torrenty", "--json", "assets"])
-                    .output()
-            }
-        }).await.ok().and_then(|r| r.ok());
-
         let mut download_url = None;
         let mut expected_size = total_size;
 
-        if let Some(out) = check_existing {
-            if out.status.success() {
-                if let Ok(json_val) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
-                    if let Some(assets) = json_val.get("assets").and_then(|a| a.as_array()) {
-                        if let Some(asset) = assets.iter().find(|a| a.get("size").and_then(|s| s.as_u64()).unwrap_or(0) > 1024) {
-                            if let Some(url) = asset.get("url").and_then(|u| u.as_str()) {
-                                download_url = Some(url.to_string());
-                                if let Some(sz) = asset.get("size").and_then(|s| s.as_u64()) {
-                                    expected_size = sz;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // 2. If not already available, dispatch cloud workflow
-        if download_url.is_none() {
-            let _ = download_tx.send((info_hash_str.clone(), DownloadEvent::Status("Dispatching cloud runner (10 Gbps)...".to_string())));
+        // Dispatch cloud workflow for a fresh accelerated download
+        let _ = download_tx.send((info_hash_str.clone(), DownloadEvent::Status("Dispatching cloud runner (10 Gbps)...".to_string())));
             let trigger = tokio::task::spawn_blocking({
                 let magnet_c = magnet.to_string();
                 let name_c = torrent_name.to_string();
@@ -867,14 +839,14 @@ impl DownloadSession {
                                 }
                             }
 
-                            if download_url.is_some() {
-                                break;
-                            }
                         }
                     }
                 }
+
+                if download_url.is_some() {
+                    break;
+                }
             }
-        }
 
         let Some(url) = download_url else {
             return Err(anyhow::anyhow!("Cloud download timed out waiting for release asset"));
@@ -882,44 +854,122 @@ impl DownloadSession {
 
         let _ = download_tx.send((info_hash_str.clone(), DownloadEvent::Status("Streaming verified data over HTTPS...".to_string())));
 
-        // Stream download directly from GitHub Release CDN over HTTPS
-        let mut resp = client.get(&url).send().await?.error_for_status()?;
-        let total_bytes = resp.content_length().unwrap_or(expected_size);
+        let probe_resp = client.get(&url).header("Range", "bytes=0-0").send().await.ok();
+        let (supports_range, total_bytes) = if let Some(ref r) = probe_resp {
+            if r.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+                let sz = r.headers()
+                    .get("Content-Range")
+                    .and_then(|h| h.to_str().ok())
+                    .and_then(|s| s.split('/').last())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(expected_size);
+                (true, sz)
+            } else {
+                (false, r.content_length().unwrap_or(expected_size))
+            }
+        } else {
+            (false, expected_size)
+        };
 
-        let mut file = std::fs::File::create(&target_path)?;
-        let mut downloaded: u64 = 0;
-        let mut last_tick = Instant::now();
-        let mut last_bytes = 0;
+        let file = std::fs::File::create(&target_path)?;
+        if total_bytes > 0 {
+            let _ = file.set_len(total_bytes);
+        }
+        drop(file);
 
-        while let Some(chunk) = resp.chunk().await? {
-            use std::io::Write;
-            file.write_all(&chunk)?;
-            downloaded += chunk.len() as u64;
+        let num_workers: usize = if supports_range && total_bytes > 10_000_000 { 12 } else { 1 };
+        let chunk_size = (total_bytes + num_workers as u64 - 1) / num_workers as u64;
+        let downloaded = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
-            let now = Instant::now();
-            if now.duration_since(last_tick).as_millis() >= 350 {
-                let dt = now.duration_since(last_tick).as_secs_f64();
-                let speed = if dt > 0.0 { ((downloaded.saturating_sub(last_bytes)) as f64 / dt) as u64 } else { 0 };
-                let ratio = if total_bytes > 0 { (downloaded as f64 / total_bytes as f64).clamp(0.0, 1.0) } else { 0.0 };
-                let _ = download_tx.send((info_hash_str.clone(), DownloadEvent::Progress {
-                    ratio,
-                    down_speed: speed,
-                    up_speed: 0,
-                    share_ratio: 0.0,
-                    progress_bytes: downloaded,
-                    finished: downloaded >= total_bytes,
+        let progress_task = {
+            let downloaded = downloaded.clone();
+            let info_hash_str = info_hash_str.clone();
+            let download_tx = download_tx.clone();
+            tokio::spawn(async move {
+                let mut last_tick = Instant::now();
+                let mut last_bytes = 0;
+                loop {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    let current = downloaded.load(Ordering::Relaxed);
+                    let now = Instant::now();
+                    let dt = now.duration_since(last_tick).as_secs_f64();
+                    let speed = if dt > 0.0 { ((current.saturating_sub(last_bytes)) as f64 / dt) as u64 } else { 0 };
+                    let ratio = if total_bytes > 0 { (current as f64 / total_bytes as f64).clamp(0.0, 1.0) } else { 0.0 };
+                    let is_done = total_bytes > 0 && current >= total_bytes;
+                    let _ = download_tx.send((info_hash_str.clone(), DownloadEvent::Progress {
+                        ratio,
+                        down_speed: speed,
+                        up_speed: 0,
+                        share_ratio: 0.0,
+                        progress_bytes: current,
+                        finished: is_done,
+                    }));
+                    last_tick = now;
+                    last_bytes = current;
+                    if is_done {
+                        break;
+                    }
+                }
+            })
+        };
+
+        if num_workers > 1 {
+            let mut handles = Vec::new();
+            for i in 0..num_workers {
+                let start = i as u64 * chunk_size;
+                let end = ((i as u64 + 1) * chunk_size - 1).min(total_bytes - 1);
+                if start > end {
+                    continue;
+                }
+                let client = client.clone();
+                let url = url.clone();
+                let target_path = target_path.clone();
+                let downloaded = downloaded.clone();
+
+                handles.push(tokio::spawn(async move {
+                    let mut resp = client.get(&url)
+                        .header("Range", format!("bytes={}-{}", start, end))
+                        .send()
+                        .await?
+                        .error_for_status()?;
+
+                    let file = std::fs::OpenOptions::new().write(true).open(&target_path)?;
+                    let mut current_offset = start;
+                    while let Some(chunk) = resp.chunk().await? {
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::FileExt;
+                            file.write_all_at(&chunk, current_offset)?;
+                        }
+                        current_offset += chunk.len() as u64;
+                        downloaded.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                    }
+                    Ok::<(), anyhow::Error>(())
                 }));
-                last_tick = now;
-                last_bytes = downloaded;
+            }
+
+            for handle in handles {
+                handle.await??;
+            }
+        } else {
+            let mut resp = client.get(&url).send().await?.error_for_status()?;
+            let mut file = std::fs::File::create(&target_path)?;
+            while let Some(chunk) = resp.chunk().await? {
+                use std::io::Write;
+                file.write_all(&chunk)?;
+                downloaded.fetch_add(chunk.len() as u64, Ordering::Relaxed);
             }
         }
 
+        let _ = progress_task.await;
+
+        let final_downloaded = downloaded.load(Ordering::Relaxed);
         let _ = download_tx.send((info_hash_str.clone(), DownloadEvent::Progress {
             ratio: 1.0,
             down_speed: 0,
             up_speed: 0,
             share_ratio: 0.0,
-            progress_bytes: downloaded,
+            progress_bytes: final_downloaded,
             finished: true,
         }));
         let _ = download_tx.send((info_hash_str, DownloadEvent::Success));

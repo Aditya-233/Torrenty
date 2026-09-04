@@ -25,13 +25,32 @@ jobs:
     name: Fast Cloud Download
     runs-on: ubuntu-latest
     steps:
+      - name: Restore Accelerator Tools
+        uses: actions/cache/restore@v4
+        id: cache-tools
+        with:
+          path: |
+            /usr/local/bin/aria2c
+            /usr/local/bin/cloudflared
+          key: cloud-tools-v5
+
       - name: Fast Zero-Install Tooling
+        if: steps.cache-tools.outputs.cache-hit != 'true'
         run: |
           echo "Installing cloud accelerator tools in parallel..."
           sudo curl -sLo /usr/local/bin/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 && sudo chmod +x /usr/local/bin/cloudflared &
-          sudo apt-get install -y --no-install-recommends aria2 >/dev/null 2>&1 &
+          (curl -sLo /tmp/aria2.tar.gz https://github.com/P3TERX/Aria2-Pro-Core/releases/latest/download/aria2-1.37.0-static-linux-amd64.tar.gz && tar -xzf /tmp/aria2.tar.gz -C /tmp && sudo mv /tmp/aria2c /usr/local/bin/ && sudo chmod +x /usr/local/bin/aria2c) || sudo apt-get install -y --no-install-recommends aria2 &
           wait
           echo "Tooling ready: aria2, cloudflared"
+
+      - name: Save Accelerator Tools
+        if: steps.cache-tools.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            /usr/local/bin/aria2c
+            /usr/local/bin/cloudflared
+          key: cloud-tools-v5
 
       - name: Extreme Accelerated Torrent Download & Stream
         env:
@@ -42,23 +61,71 @@ jobs:
           cd /dev/shm/dl
           echo "Starting extreme accelerated download for ${{ inputs.name }}..."
 
-          # Launch local HTTP server and Cloudflare Quick Tunnel in background (Strategy 3)
-          python3 -m http.server 8080 --directory /dev/shm/dl >/dev/null 2>&1 &
+          # Launch Python Multi-Threaded Range Server (RFC-7233) for 12x parallel client streaming
+          python3 -c "
+          import os, functools
+          from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
+
+          class RangeRequestHandler(SimpleHTTPRequestHandler):
+              def send_head(self):
+                  path = self.translate_path(self.path)
+                  if not os.path.isfile(path):
+                      return super().send_head()
+                  f = open(path, 'rb')
+                  size = os.fstat(f.fileno()).st_size
+                  range_header = self.headers.get('Range')
+                  if not range_header:
+                      return super().send_head()
+                  try:
+                      val = range_header.strip().lower()
+                      if val.startswith('bytes='):
+                          val = val[6:].split(',')[0].strip()
+                          start_str, end_str = val.split('-')
+                          start = int(start_str) if start_str else 0
+                          end = int(end_str) if end_str else size - 1
+                          if start >= size or start > end:
+                              self.send_error(416, 'Range Not Satisfiable')
+                              f.close()
+                              return None
+                          self.send_response(206)
+                          self.send_header('Content-Type', self.guess_type(path))
+                          self.send_header('Content-Range', f'bytes {start}-{end}/{size}')
+                          self.send_header('Content-Length', str(end - start + 1))
+                          self.send_header('Accept-Ranges', 'bytes')
+                          self.send_header('Connection', 'keep-alive')
+                          self.end_headers()
+                          f.seek(start)
+                          self.wfile.write(f.read(end - start + 1))
+                          f.close()
+                          return None
+                  except Exception:
+                      f.close()
+                  return super().send_head()
+
+          server = ThreadingHTTPServer(('0.0.0.0', 8080), functools.partial(RangeRequestHandler, directory='/dev/shm/dl'))
+          server.serve_forever()
+          " > /dev/shm/server.log 2>&1 &
+
           cloudflared tunnel --url http://127.0.0.1:8080 > /dev/shm/tunnel.log 2>&1 &
 
           ARIA2_OPTS=(
             --seed-time=0
             --file-allocation=falloc
-            --bt-max-peers=250
-            --bt-request-peer-speed-limit=100M
+            --bt-max-peers=0
+            --bt-request-peer-speed-limit=0
             --disk-cache=512M
             --max-overall-upload-limit=1K
-            --bt-tracker-connect-timeout=3
-            --bt-tracker-timeout=3
+            --bt-tracker-connect-timeout=2
+            --bt-tracker-timeout=2
             --dht-entry-point=dht.transmissionbt.com:6881
-            --summary-interval=2
+            --summary-interval=1
             --enable-peer-exchange=true
             --bt-prioritize-piece=head,tail
+            --max-connection-per-server=16
+            --split=64
+            --min-split-size=1M
+            --event-poll=epoll
+            --bt-min-crypto-level=plain
           )
 
           TORRENT_URL="${{ inputs.torrent_url }}"
