@@ -70,6 +70,7 @@ Torrenty accelerates torrent downloads by offloading BitTorrent swarm discovery 
 | `socks5://` local DNS resolution | Assume local DNS is unaffected | Local DNS poisoned by ISP; caused indexer searches to hang. | **DISCARDED** (Use `socks5h://`) |
 | Unbounded `tokio::join!` indexer calls | Wait for all indexers together | Dead indexers (PirateBay) blocked fast indexers (Nyaa). | **DISCARDED** (Independent timeouts & streaming) |
 | Omitting `--bt-tracker` on `.torrent` | Assume `.torrent` embedded tracker suffices | Tracker failure stalled aria2c at `CN:50 SD:0` indefinitely. | **DISCARDED** (Inject public trackers + bt-stop-timeout) |
+| Premature Tunnel Shutdown & Blanket 10s Timeout | Wait only for `gh release upload` to exit | Tunnel died after 29s mid-client stream; 10s timeout aborted chunks | **DISCARDED** (Activity-based hold + 600s override + CDN failover) |
 
 ---
 

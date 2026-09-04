@@ -90,6 +90,14 @@ Future agents **MUST NOT** reintroduce any of the following failed approaches. E
   - Set `--bt-stop-timeout=25` on direct `.torrent` downloads so stalls immediately trigger failover to the magnet URI fallback.
   - Purge any local port (e.g. 127.0.0.1:8080) from tracker announcement lists.
 
+### ❌ 12. NEVER terminate the Cloudflare Tunnel immediately after release backup upload or omit client streaming retry & CDN failover
+* **What went wrong**: In workflow run 33910858367, the user tried downloading Slime S04E21 (1.40 GB). The GitHub Actions runner uploaded the backup release asset to GitHub at 1 Gbps in just 29 seconds. The workflow step exited as soon as `gh release upload` finished (`wait $UPLOAD_PID`), killing `cloudflared` and `python3`. Meanwhile, the user's client was streaming at ~15 MB/s and got abruptly severed at 21.9% (306.75 MB). Additionally, `reqwest::Client` had a default 10s blanket request timeout that severed large range chunks, and workers lacked retry loops and GitHub Release CDN failover.
+* **Correct Implementation**:
+  - **Activity-Based Tunnel Holding**: The runner must monitor `/dev/shm/last_transfer` and hold the Cloudflare Tunnel open as long as client streaming is active (until 75s of idle after active transfer and backup upload completion, up to 25m).
+  - **Worker Streaming Timeout Override**: Streaming requests must override the client-level timeout with `.timeout(Duration::from_secs(600))` so workers are never prematurely aborted while reading large chunks.
+  - **Resilient Chunk Retry**: Range workers must retry with exponential backoff right from `current_offset`.
+  - **GitHub Release CDN Auto-Failover**: If the Cloudflare Tunnel drops or resets, workers automatically fail over to the permanent GitHub Release asset URL (`https://github.com/{REPO}/releases/download/{TAG}/{FILE}`) to resume downloading without losing progress.
+
 ---
 
 ## 3. Proven High-Performance Configuration Reference

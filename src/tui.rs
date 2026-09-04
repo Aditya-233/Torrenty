@@ -802,6 +802,7 @@ impl DownloadSession {
         let _ = download_tx.send((info_hash_str.clone(), DownloadEvent::Status("DPI detected. Activating Cloud Accelerator...".to_string())));
 
         let mut download_url = None;
+        let mut backup_asset_url = None;
         let mut expected_size = total_size;
 
         // Dispatch cloud workflow for a fresh accelerated download
@@ -864,14 +865,12 @@ impl DownloadSession {
                                 }
                             }
 
-                            if download_url.is_none() {
-                                if let Some(assets) = json_val.get("assets").and_then(|a| a.as_array()) {
-                                    if let Some(asset) = assets.iter().find(|a| a.get("size").and_then(|s| s.as_u64()).unwrap_or(0) > 1024) {
-                                        if let Some(url) = asset.get("url").and_then(|u| u.as_str()) {
-                                            download_url = Some(url.to_string());
-                                            if let Some(sz) = asset.get("size").and_then(|s| s.as_u64()) {
-                                                expected_size = sz;
-                                            }
+                            if let Some(assets) = json_val.get("assets").and_then(|a| a.as_array()) {
+                                if let Some(asset) = assets.iter().find(|a| a.get("size").and_then(|s| s.as_u64()).unwrap_or(0) > 1024) {
+                                    if let Some(url) = asset.get("url").and_then(|u| u.as_str()) {
+                                        backup_asset_url = Some(url.to_string());
+                                        if let Some(sz) = asset.get("size").and_then(|s| s.as_u64()) {
+                                            expected_size = sz;
                                         }
                                     }
                                 }
@@ -886,13 +885,28 @@ impl DownloadSession {
                 }
             }
 
-        let Some(url) = download_url else {
+        let Some(url) = download_url.or_else(|| backup_asset_url.clone()) else {
             return Err(anyhow::anyhow!("Cloud download timed out waiting for release asset"));
         };
 
+        // Deterministic backup asset URL from GitHub Release
+        let backup_url = backup_asset_url.or_else(|| {
+            let filename = url.rsplit('/').next().unwrap_or("");
+            if !filename.is_empty() {
+                Some(format!("https://github.com/Aditya-233/Torrenty/releases/download/{tag}/{filename}"))
+            } else {
+                None
+            }
+        });
+
         let _ = download_tx.send((info_hash_str.clone(), DownloadEvent::Status("Streaming verified data over HTTPS...".to_string())));
 
-        let probe_resp = client.get(&url).header("Range", "bytes=0-0").send().await.ok();
+        let probe_resp = client.get(&url)
+            .timeout(Duration::from_secs(15))
+            .header("Range", "bytes=0-0")
+            .send()
+            .await
+            .ok();
         let (supports_range, total_bytes) = if let Some(ref r) = probe_resp {
             if r.status() == reqwest::StatusCode::PARTIAL_CONTENT {
                 let sz = r.headers()
@@ -960,27 +974,69 @@ impl DownloadSession {
                     continue;
                 }
                 let client = client.clone();
-                let url = url.clone();
+                let primary_url = url.clone();
+                let backup_url = backup_url.clone();
                 let target_path = target_path.clone();
                 let downloaded = downloaded.clone();
 
                 handles.push(tokio::spawn(async move {
-                    let mut resp = client.get(&url)
-                        .header("Range", format!("bytes={}-{}", start, end))
-                        .send()
-                        .await?
-                        .error_for_status()?;
-
                     let file = std::fs::OpenOptions::new().write(true).open(&target_path)?;
                     let mut current_offset = start;
-                    while let Some(chunk) = resp.chunk().await? {
-                        #[cfg(unix)]
-                        {
-                            use std::os::unix::fs::FileExt;
-                            file.write_all_at(&chunk, current_offset)?;
+                    let mut attempts = 0;
+                    let mut use_backup = false;
+
+                    while current_offset <= end && attempts < 25 {
+                        attempts += 1;
+                        let active_url = if use_backup {
+                            backup_url.as_deref().unwrap_or(&primary_url)
+                        } else {
+                            &primary_url
+                        };
+
+                        let range_header = format!("bytes={}-{}", current_offset, end);
+                        let req = client.get(active_url)
+                            .timeout(Duration::from_secs(600))
+                            .header("Range", &range_header)
+                            .send()
+                            .await;
+
+                        match req {
+                            Ok(resp) if resp.status().is_success() || resp.status() == reqwest::StatusCode::PARTIAL_CONTENT => {
+                                let mut stream = resp;
+                                while let Ok(Some(chunk)) = stream.chunk().await {
+                                    #[cfg(unix)]
+                                    {
+                                        use std::os::unix::fs::FileExt;
+                                        if let Err(e) = file.write_all_at(&chunk, current_offset) {
+                                            return Err(anyhow::anyhow!("Write error: {e}"));
+                                        }
+                                    }
+                                    current_offset += chunk.len() as u64;
+                                    downloaded.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                                    attempts = 0;
+                                }
+                                if current_offset > end {
+                                    return Ok(());
+                                }
+                            }
+                            Ok(resp) => {
+                                crate::log_warn!("Worker [{start}-{end}] status {}: failover to backup asset", resp.status());
+                                if backup_url.is_some() {
+                                    use_backup = true;
+                                }
+                            }
+                            Err(e) => {
+                                crate::log_warn!("Worker [{start}-{end}] error (attempt {attempts}/25): {e}");
+                                if backup_url.is_some() {
+                                    use_backup = true;
+                                }
+                            }
                         }
-                        current_offset += chunk.len() as u64;
-                        downloaded.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                        tokio::time::sleep(Duration::from_millis(500 * attempts.min(6))).await;
+                    }
+
+                    if current_offset <= end {
+                        return Err(anyhow::anyhow!("Worker failed slice {start}-{end} (offset {current_offset}/{end})"));
                     }
                     Ok::<(), anyhow::Error>(())
                 }));
@@ -990,12 +1046,57 @@ impl DownloadSession {
                 handle.await??;
             }
         } else {
-            let mut resp = client.get(&url).send().await?.error_for_status()?;
-            let mut file = std::fs::File::create(&target_path)?;
-            while let Some(chunk) = resp.chunk().await? {
-                use std::io::Write;
-                file.write_all(&chunk)?;
-                downloaded.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+            let file = std::fs::OpenOptions::new().write(true).open(&target_path)?;
+            let mut current_offset = 0;
+            let mut attempts = 0;
+            let mut use_backup = false;
+
+            while current_offset < total_bytes && attempts < 25 {
+                attempts += 1;
+                let active_url = if use_backup {
+                    backup_url.as_deref().unwrap_or(&url)
+                } else {
+                    &url
+                };
+
+                let req = if supports_range && total_bytes > 0 {
+                    client.get(active_url)
+                        .timeout(Duration::from_secs(600))
+                        .header("Range", format!("bytes={}-{}", current_offset, total_bytes - 1))
+                } else {
+                    client.get(active_url).timeout(Duration::from_secs(600))
+                };
+
+                match req.send().await {
+                    Ok(resp) if resp.status().is_success() || resp.status() == reqwest::StatusCode::PARTIAL_CONTENT => {
+                        let mut stream = resp;
+                        while let Ok(Some(chunk)) = stream.chunk().await {
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::fs::FileExt;
+                                if let Err(e) = file.write_all_at(&chunk, current_offset) {
+                                    return Err(anyhow::anyhow!("Write error: {e}"));
+                                }
+                            }
+                            current_offset += chunk.len() as u64;
+                            downloaded.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                            attempts = 0;
+                        }
+                        if current_offset >= total_bytes {
+                            break;
+                        }
+                    }
+                    Ok(_) | Err(_) => {
+                        if backup_url.is_some() {
+                            use_backup = true;
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(500 * attempts.min(6))).await;
+            }
+
+            if current_offset < total_bytes {
+                return Err(anyhow::anyhow!("Single-worker failed to complete download (stopped at {current_offset}/{total_bytes})"));
             }
         }
 

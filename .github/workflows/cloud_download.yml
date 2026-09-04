@@ -68,7 +68,7 @@ jobs:
 
           # Launch Python Multi-Threaded Range Server (RFC-7233) for 12x parallel client streaming
           python3 -c "
-          import os, functools
+          import os, functools, time
           from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 
           class RangeRequestHandler(SimpleHTTPRequestHandler):
@@ -100,7 +100,16 @@ jobs:
                           self.send_header('Connection', 'keep-alive')
                           self.end_headers()
                           f.seek(start)
-                          self.wfile.write(f.read(end - start + 1))
+                          to_send = end - start + 1
+                          buf_size = 256 * 1024
+                          while to_send > 0:
+                              chunk = f.read(min(buf_size, to_send))
+                              if not chunk:
+                                  break
+                              self.wfile.write(chunk)
+                              to_send -= len(chunk)
+                              with open('/dev/shm/last_transfer', 'w') as tf:
+                                  tf.write(str(time.time()))
                           f.close()
                           return None
                   except Exception:
@@ -196,13 +205,56 @@ jobs:
           fi
 
           # Upload to GitHub Release as permanent backup while client streams via tunnel
+          UPLOAD_PID=""
           if [ -n "$TARGET_FILE" ]; then
             echo "Starting GitHub release backup upload in background..."
             gh release upload "$TAG" "$TARGET_FILE" --repo "$REPO" --clobber &
             UPLOAD_PID=$!
-            echo "Holding stream tunnel alive during release upload..."
-            wait $UPLOAD_PID 2>/dev/null || sleep 90
-            echo "Upload and stream session complete."
-          else
-            sleep 60
           fi
+
+          echo "Holding stream tunnel active for client streaming..."
+          START_HOLD=$(date +%s)
+          UPLOAD_DONE=0
+          while true; do
+            NOW=$(date +%s)
+            ELAPSED=$((NOW - START_HOLD))
+
+            # 1. Hard safety ceiling: 25 minutes (1500 seconds)
+            if [ "$ELAPSED" -gt 1500 ]; then
+              echo "Max stream hold time reached (25m). Completing job."
+              break
+            fi
+
+            # 2. Check if background backup upload finished
+            if [ -n "$UPLOAD_PID" ]; then
+              if ! kill -0 $UPLOAD_PID 2>/dev/null; then
+                UPLOAD_DONE=1
+              fi
+            else
+              UPLOAD_DONE=1
+            fi
+
+            # 3. Check client streaming activity via /dev/shm/last_transfer
+            if [ -f /dev/shm/last_transfer ]; then
+              LAST_ACTIVE=$(stat -c %Y /dev/shm/last_transfer 2>/dev/null || echo "$NOW")
+              IDLE=$((NOW - LAST_ACTIVE))
+              # If transfer was active and has now been idle for at least 75s (and backup upload finished)
+              if [ "$IDLE" -gt 75 ] && [ "$ELAPSED" -gt 120 ] && [ "$UPLOAD_DONE" -eq 1 ]; then
+                echo "Stream idle for ${IDLE}s after active transfer and backup upload complete. Completing job."
+                break
+              fi
+            else
+              # If client hasn't started requesting yet, wait up to 5 minutes (300s) before terminating
+              if [ "$ELAPSED" -gt 300 ] && [ "$UPLOAD_DONE" -eq 1 ]; then
+                echo "No stream requests received within 5m. Completing job."
+                break
+              fi
+            fi
+
+            sleep 5
+          done
+
+          if [ -n "$UPLOAD_PID" ]; then
+            wait $UPLOAD_PID 2>/dev/null || true
+          fi
+          echo "Upload and stream session complete."
