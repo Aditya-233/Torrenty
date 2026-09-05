@@ -127,6 +127,17 @@ Future agents **MUST NOT** reintroduce any of the following failed approaches. E
   - **Zero-Copy Range Streaming**: Use Linux kernel `os.sendfile` with 8 MB chunks, `TCP_NODELAY`, `wfile.flush()`, and throttle `/dev/shm/last_transfer` updates to once per range slice.
   - **Direct Client Streaming Client**: Use a dedicated `reqwest::Client` with `no_proxy()`, `tcp_nodelay(true)`, and `pool_max_idle_per_host(64)` with 24 concurrent workers for files > 500 MB (16 for > 10 MB).
 
+### ❌ 15. NEVER throttle upload to 1K (`--max-overall-upload-limit=1K`) or multiplex streaming workers on a single HTTP/2 socket
+* **What went wrong**:
+  1. Setting `--max-overall-upload-limit=1K` triggered BitTorrent's tit-for-tat choke algorithm. Connected peers and seeders identified our runner as an uncooperative leecher and choked transfer slots after the initial 30s optimistic window, artificially throttling swarm speeds to ~30 MiB/s even with 276 peers connected.
+  2. The Rust streaming client defaulted to ALPN HTTP/2 with Cloudflare Edge. All 24 range workers multiplexed onto a single TCP connection; a single lost packet triggered TCP Head-of-Line (HOL) blocking across all 24 workers simultaneously.
+  3. The local client polled `gh release view` on a 3-second sleep interval, adding up to 3 seconds of dead wait before discovering published stream URLs.
+* **Correct Implementation**:
+  - Set `--max-overall-upload-limit=50M` in `ARIA2_OPTS` to participate cooperatively in tit-for-tat and unlock reciprocal seeder unchoking.
+  - Set `--file-allocation=none` and `--event-poll=epoll` for zero-overhead RAM disk allocation and scalable Linux epoll socket polling.
+  - Configure `streaming_client` with `.http1_only()` to guarantee 24 independent TCP sockets and congestion windows with no shared HOL blocking.
+  - Pre-extract the Cloudflare tunnel URL in the background during swarm download so discovery latency is 0s, and poll releases every 500ms (`Duration::from_millis(500)`).
+
 ---
 
 ## 3. Proven High-Performance Configuration Reference
@@ -138,11 +149,12 @@ PUBLIC_TRACKERS="udp://tracker.opentrackr.org:1337/announce,udp://open.stealth.s
 
 ARIA2_OPTS=(
   --seed-time=0
-  --file-allocation=falloc
+  --file-allocation=none
+  --event-poll=epoll
   --bt-max-peers=500
   --bt-request-peer-speed-limit=200M
   --disk-cache=512M
-  --max-overall-upload-limit=1K
+  --max-overall-upload-limit=50M
   --bt-tracker-connect-timeout=5
   --bt-tracker-timeout=5
   --bt-tracker-interval=10

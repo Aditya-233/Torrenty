@@ -822,10 +822,10 @@ impl DownloadSession {
                 return Err(anyhow::anyhow!("Failed to dispatch GitHub cloud workflow: {}", String::from_utf8_lossy(&trigger.stderr)));
             }
 
-            // Poll every 3 seconds for up to 6 minutes
+            // Poll every 500ms for up to 6 minutes for sub-second stream URL discovery
             let start = Instant::now();
             while start.elapsed() < Duration::from_secs(360) {
-                tokio::time::sleep(Duration::from_secs(3)).await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
                 let elapsed_sec = start.elapsed().as_secs();
                 let _ = download_tx.send((info_hash_str.clone(), DownloadEvent::Status(format!("Cloud downloading swarm ({}s)...", elapsed_sec))));
 
@@ -891,9 +891,10 @@ impl DownloadSession {
 
         let _ = download_tx.send((info_hash_str.clone(), DownloadEvent::Status("Streaming verified data over HTTPS...".to_string())));
 
-        // Create dedicated streaming client bypassing local SOCKS proxies with TCP_NODELAY and connection pooling
+        // Create dedicated streaming client bypassing local SOCKS proxies with TCP_NODELAY, independent HTTP/1.1 connections, and connection pooling
         let streaming_client = reqwest::Client::builder()
             .no_proxy()
+            .http1_only()
             .tcp_nodelay(true)
             .pool_max_idle_per_host(64)
             .build()

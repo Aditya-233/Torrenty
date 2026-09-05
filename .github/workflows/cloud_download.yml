@@ -141,15 +141,28 @@ jobs:
 
           cloudflared tunnel --url http://127.0.0.1:8080 > /dev/shm/tunnel.log 2>&1 &
 
+          # Pre-extract Cloudflare tunnel URL in background while download runs for 0s discovery latency
+          (
+            for i in {1..30}; do
+              T_URL=$(grep -oE "https://[a-zA-Z0-9-]+\.trycloudflare\.com" /dev/shm/tunnel.log | head -n 1 || true)
+              if [ -n "$T_URL" ]; then
+                echo "$T_URL" > /dev/shm/tunnel_url.txt
+                break
+              fi
+              sleep 0.5
+            done
+          ) &
+
           PUBLIC_TRACKERS="udp://tracker.opentrackr.org:1337/announce,udp://open.stealth.si:80/announce,udp://tracker.torrent.eu.org:451/announce,udp://open.demonii.com:1337/announce,udp://tracker.therarbg.to:6969/announce,udp://tracker.dler.org:6969/announce,udp://explodie.org:6969/announce,udp://zer0day.ch:1337/announce,udp://tracker.qu.ax:6969/announce,https://tracker.pmman.tech:443/announce,https://tracker.tamersunion.org:443/announce,https://tracker.nekobt.to/api/tracker/public/announce,http://nyaa.tracker.wf:7777/announce,https://tracker.nekomi.cn:443/announce,https://tracker.leechshield.link:443/announce,https://tracker.7471.top:443/announce,https://tracker.foreverpirates.co:443/announce"
 
           ARIA2_OPTS=(
             --seed-time=0
-            --file-allocation=falloc
+            --file-allocation=none
+            --event-poll=epoll
             --bt-max-peers=500
             --bt-request-peer-speed-limit=200M
             --disk-cache=512M
-            --max-overall-upload-limit=1K
+            --max-overall-upload-limit=50M
             --bt-tracker-connect-timeout=5
             --bt-tracker-timeout=5
             --bt-tracker-interval=10
@@ -224,13 +237,18 @@ jobs:
 
           # Extract Cloudflare tunnel URL
           TUNNEL_URL=""
-          for i in {1..15}; do
-            TUNNEL_URL=$(grep -oE "https://[a-zA-Z0-9-]+\.trycloudflare\.com" /dev/shm/tunnel.log | head -n 1 || true)
-            if [ -n "$TUNNEL_URL" ]; then
-              break
-            fi
-            sleep 1
-          done
+          if [ -s /dev/shm/tunnel_url.txt ]; then
+            TUNNEL_URL=$(cat /dev/shm/tunnel_url.txt | tr -d '[:space:]')
+          fi
+          if [ -z "$TUNNEL_URL" ]; then
+            for i in {1..10}; do
+              TUNNEL_URL=$(grep -oE "https://[a-zA-Z0-9-]+\.trycloudflare\.com" /dev/shm/tunnel.log | head -n 1 || true)
+              if [ -n "$TUNNEL_URL" ]; then
+                break
+              fi
+              sleep 0.5
+            done
+          fi
           echo "Discovered Tunnel URL: $TUNNEL_URL"
           if [ -z "$TUNNEL_URL" ]; then
             echo "Tunnel log output:"
