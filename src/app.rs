@@ -1,6 +1,6 @@
 use crate::indexer::build_client;
 use crate::tui::run_search_tui;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use librqbit::Session;
 use std::collections::HashSet;
 
@@ -26,7 +26,10 @@ pub async fn run() -> Result<()> {
     let session = Session::new_with_opts(download_dir.clone(), opts)
         .await
         .map_err(|e| anyhow!("failed to initialize rqbit session: {e}"))?;
-    crate::log_info!("Initialized librqbit session (download_dir: {:?})", download_dir);
+    crate::log_info!(
+        "Initialized librqbit session (download_dir: {:?})",
+        download_dir
+    );
 
     let history_path = crate::storage::history_path();
     // Clean up past history file on startup so TUI always starts completely clean without showing past files
@@ -37,5 +40,3 @@ pub async fn run() -> Result<()> {
 
     run_search_tui(session, history_entries, history_path, client).await
 }
-
-

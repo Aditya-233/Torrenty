@@ -7,14 +7,19 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
-use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode};
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
 use librqbit::{AddTorrent, AddTorrentOptions, Session};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Clear, Gauge, List, ListItem, ListState, Paragraph, Row, Table, TableState};
+use ratatui::widgets::{
+    Block, Borders, Cell, Clear, Gauge, List, ListItem, ListState, Paragraph, Row, Table,
+    TableState,
+};
 
 use crate::storage::{DownloadHistoryEntry, now_epoch_secs};
 use crate::types::Torrent;
@@ -45,7 +50,12 @@ impl Drop for TerminalGuard {
 /// # Errors
 ///
 /// Returns an error if terminal setup fails or the event loop encounters an error.
-pub async fn run_search_tui(session: Arc<Session>, history_entries: Vec<DownloadHistoryEntry>, history_path: PathBuf, client: reqwest::Client) -> Result<()> {
+pub async fn run_search_tui(
+    session: Arc<Session>,
+    history_entries: Vec<DownloadHistoryEntry>,
+    history_path: PathBuf,
+    client: reqwest::Client,
+) -> Result<()> {
     let mut terminal = setup_terminal()?;
     let _guard = TerminalGuard;
     let mut app = SearchTui::new(session, history_entries, history_path, client);
@@ -84,6 +94,17 @@ struct SearchTui {
     results_rx: tokio::sync::mpsc::UnboundedReceiver<Result<Vec<Torrent>>>,
 }
 
+struct CloudAccelerationParams<'a> {
+    pub client: &'a reqwest::Client,
+    pub info_hash: &'a str,
+    pub torrent_name: &'a str,
+    pub magnet: &'a str,
+    pub torrent_url: Option<String>,
+    pub target_path: PathBuf,
+    pub total_size: u64,
+    pub download_tx: &'a tokio::sync::mpsc::UnboundedSender<(String, DownloadEvent)>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FocusPane {
     Query,
@@ -92,7 +113,12 @@ enum FocusPane {
 }
 
 impl SearchTui {
-    fn new(session: Arc<Session>, _history_entries: Vec<DownloadHistoryEntry>, history_path: PathBuf, client: reqwest::Client) -> Self {
+    fn new(
+        session: Arc<Session>,
+        _history_entries: Vec<DownloadHistoryEntry>,
+        history_path: PathBuf,
+        client: reqwest::Client,
+    ) -> Self {
         let downloads: Vec<DownloadSession> = Vec::new();
 
         let (download_tx, download_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -153,10 +179,7 @@ impl SearchTui {
             }
 
             let mut buf = [0u8; 68];
-            match stream.read(&mut buf) {
-                Ok(n) if n > 0 => false,
-                _ => true,
-            }
+            !matches!(stream.read(&mut buf), Ok(n) if n > 0)
         }).await.unwrap_or(true);
 
         dpi_blocked.store(is_blocked, Ordering::Relaxed);
@@ -228,8 +251,13 @@ impl SearchTui {
     }
 
     fn draw_query(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
-        let query_block = Block::default().borders(Borders::ALL).title(" Search Query ").border_style(self.focus_style(FocusPane::Query));
-        let query = Paragraph::new(self.query_input.as_str()).block(query_block).style(Style::default().fg(TEXT));
+        let query_block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Search Query ")
+            .border_style(self.focus_style(FocusPane::Query));
+        let query = Paragraph::new(self.query_input.as_str())
+            .block(query_block)
+            .style(Style::default().fg(TEXT));
         frame.render_widget(query, area);
 
         if matches!(self.focus, FocusPane::Query) && !self.show_help {
@@ -242,21 +270,66 @@ impl SearchTui {
 
     fn draw_results(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
         if self.is_searching {
-            let text = Paragraph::new(Span::styled("Searching...", Style::default().fg(SKY))).block(Block::default().padding(ratatui::widgets::Padding::horizontal(1)));
+            let text = Paragraph::new(Span::styled("Searching...", Style::default().fg(SKY)))
+                .block(Block::default().padding(ratatui::widgets::Padding::horizontal(1)));
             frame.render_widget(text, area);
         } else if self.results.is_empty() {
-            let text = Paragraph::new(Span::styled("No results found.", Style::default().fg(OVERLAY0))).block(Block::default().padding(ratatui::widgets::Padding::horizontal(1)));
+            let text = Paragraph::new(Span::styled(
+                "No results found.",
+                Style::default().fg(OVERLAY0),
+            ))
+            .block(Block::default().padding(ratatui::widgets::Padding::horizontal(1)));
             frame.render_widget(text, area);
         } else {
-            let header = Row::new([Cell::from("Seed").style(Style::default().fg(OVERLAY0).add_modifier(Modifier::BOLD)), Cell::from("Size").style(Style::default().fg(OVERLAY0).add_modifier(Modifier::BOLD)), Cell::from("Name").style(Style::default().fg(OVERLAY0).add_modifier(Modifier::BOLD))]).bottom_margin(1);
+            let header = Row::new([
+                Cell::from("Seed")
+                    .style(Style::default().fg(OVERLAY0).add_modifier(Modifier::BOLD)),
+                Cell::from("Size")
+                    .style(Style::default().fg(OVERLAY0).add_modifier(Modifier::BOLD)),
+                Cell::from("Name")
+                    .style(Style::default().fg(OVERLAY0).add_modifier(Modifier::BOLD)),
+            ])
+            .bottom_margin(1);
 
-            let rows = self.results.iter().map(|torrent| Row::new([Cell::from(Span::styled(torrent.seeders.to_string(), Style::default().fg(YELLOW).add_modifier(Modifier::BOLD))), Cell::from(Span::styled(crate::util::format_size(torrent.size_bytes), Style::default().fg(SKY))), Cell::from(Span::styled(torrent.name.as_str(), Style::default().fg(TEXT)))]));
+            let rows = self.results.iter().map(|torrent| {
+                Row::new([
+                    Cell::from(Span::styled(
+                        torrent.seeders.to_string(),
+                        Style::default().fg(YELLOW).add_modifier(Modifier::BOLD),
+                    )),
+                    Cell::from(Span::styled(
+                        crate::util::format_size(torrent.size_bytes),
+                        Style::default().fg(SKY),
+                    )),
+                    Cell::from(Span::styled(
+                        torrent.name.as_str(),
+                        Style::default().fg(TEXT),
+                    )),
+                ])
+            });
 
-            let widths = [Constraint::Length(6), Constraint::Length(10), Constraint::Min(20)];
+            let widths = [
+                Constraint::Length(6),
+                Constraint::Length(10),
+                Constraint::Min(20),
+            ];
 
-            let (bg_color, fg_color) = if self.focus == FocusPane::Results { (SURFACE1, YELLOW) } else { (SURFACE0, OVERLAY0) };
+            let (bg_color, fg_color) = if self.focus == FocusPane::Results {
+                (SURFACE1, YELLOW)
+            } else {
+                (SURFACE0, OVERLAY0)
+            };
 
-            let table = Table::new(rows, widths).header(header).block(Block::default().padding(ratatui::widgets::Padding::horizontal(1))).row_highlight_style(Style::default().bg(bg_color).fg(fg_color).add_modifier(Modifier::BOLD)).highlight_symbol("▌ ");
+            let table = Table::new(rows, widths)
+                .header(header)
+                .block(Block::default().padding(ratatui::widgets::Padding::horizontal(1)))
+                .row_highlight_style(
+                    Style::default()
+                        .bg(bg_color)
+                        .fg(fg_color)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .highlight_symbol("▌ ");
 
             let mut table_state = TableState::default();
             table_state.select((!self.results.is_empty()).then_some(self.selected_result));
@@ -268,21 +341,44 @@ impl SearchTui {
         let mut download_items: Vec<ListItem<'_>> = Vec::with_capacity(self.downloads.len() + 1);
 
         for download in &self.downloads {
-            let line = Line::from(vec![download.status_badge(), Span::raw(" "), Span::styled(download.torrent.name.as_str(), Style::default().fg(TEXT))]);
+            let line = Line::from(vec![
+                download.status_badge(),
+                Span::raw(" "),
+                Span::styled(download.torrent.name.as_str(), Style::default().fg(TEXT)),
+            ]);
             download_items.push(ListItem::new(line));
         }
 
         if download_items.is_empty() {
-            download_items.push(ListItem::new(Line::from(Span::styled("No active downloads.", Style::default().fg(OVERLAY0)))));
+            download_items.push(ListItem::new(Line::from(Span::styled(
+                "No active downloads.",
+                Style::default().fg(OVERLAY0),
+            ))));
         }
-        let downloads = List::new(download_items).block(Block::default().borders(Borders::ALL).title(" Downloads ").border_style(self.focus_style(FocusPane::Downloads))).highlight_style(Style::default().fg(YELLOW).bg(SURFACE1).add_modifier(Modifier::BOLD)).highlight_symbol("▌ ");
+        let downloads = List::new(download_items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Downloads ")
+                    .border_style(self.focus_style(FocusPane::Downloads)),
+            )
+            .highlight_style(
+                Style::default()
+                    .fg(YELLOW)
+                    .bg(SURFACE1)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("▌ ");
         let mut downloads_state = ListState::default();
         downloads_state.select((!self.downloads.is_empty()).then_some(self.selected_download));
         frame.render_stateful_widget(downloads, area, &mut downloads_state);
     }
 
     fn draw_downloads_activity(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
-        let activity_block = Block::default().borders(Borders::ALL).title(" Activity ").border_style(Style::default().fg(OVERLAY0));
+        let activity_block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Activity ")
+            .border_style(Style::default().fg(OVERLAY0));
         let inner_area = activity_block.inner(area);
         frame.render_widget(activity_block, area);
 
@@ -304,7 +400,10 @@ impl SearchTui {
                 ]),
                 Line::from(vec![
                     Span::styled("Path    ", Style::default().fg(OVERLAY0)),
-                    Span::styled(download.target_path.display().to_string(), Style::default().fg(GREEN)),
+                    Span::styled(
+                        download.target_path.display().to_string(),
+                        Style::default().fg(GREEN),
+                    ),
                 ]),
                 Line::from(vec![
                     Span::styled("Size    ", Style::default().fg(OVERLAY0)),
@@ -319,10 +418,22 @@ impl SearchTui {
             ]);
             frame.render_widget(info_paragraph, right_chunks[0]);
 
-            let progress_chunks = Layout::horizontal([Constraint::Length(17), Constraint::Length(24), Constraint::Min(0)]).split(right_chunks[1]);
+            let progress_chunks = Layout::horizontal([
+                Constraint::Length(17),
+                Constraint::Length(24),
+                Constraint::Min(0),
+            ])
+            .split(right_chunks[1]);
 
             let summary = download.progress_summary();
-            let prefix = Paragraph::new(Line::from(vec![Span::styled("Progress ", Style::default().fg(OVERLAY0)), Span::styled(summary, Style::default().fg(SKY).add_modifier(Modifier::BOLD)), Span::raw("  ")]));
+            let prefix = Paragraph::new(Line::from(vec![
+                Span::styled("Progress ", Style::default().fg(OVERLAY0)),
+                Span::styled(
+                    summary,
+                    Style::default().fg(SKY).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+            ]));
             frame.render_widget(prefix, progress_chunks[0]);
 
             let ratio = download.progress_ratio().clamp(0.0, 1.0);
@@ -334,19 +445,30 @@ impl SearchTui {
                 SKY
             };
 
-            let gauge = Gauge::default().gauge_style(Style::default().fg(gauge_color).bg(SURFACE0)).use_unicode(true).ratio(ratio).label("");
+            let gauge = Gauge::default()
+                .gauge_style(Style::default().fg(gauge_color).bg(SURFACE0))
+                .use_unicode(true)
+                .ratio(ratio)
+                .label("");
             frame.render_widget(gauge, progress_chunks[1]);
 
-            let suffix = Paragraph::new(Line::from(vec![Span::raw("  "), Span::styled(download.status_text.as_str(), Style::default().fg(TEXT))]));
+            let suffix = Paragraph::new(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(download.status_text.as_str(), Style::default().fg(TEXT)),
+            ]));
             frame.render_widget(suffix, progress_chunks[2]);
         } else {
-            let empty_text = Paragraph::new(Line::from(Span::styled("No downloads yet.", Style::default().fg(OVERLAY0))));
+            let empty_text = Paragraph::new(Line::from(Span::styled(
+                "No downloads yet.",
+                Style::default().fg(OVERLAY0),
+            )));
             frame.render_widget(empty_text, right_chunks[0]);
         }
     }
 
     fn draw_downloads(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
-        let bottom = Layout::horizontal([Constraint::Percentage(38), Constraint::Percentage(62)]).split(area);
+        let bottom = Layout::horizontal([Constraint::Percentage(38), Constraint::Percentage(62)])
+            .split(area);
 
         self.draw_downloads_list(frame, bottom[0]);
         self.draw_downloads_activity(frame, bottom[1]);
@@ -365,9 +487,34 @@ impl SearchTui {
             // Clear the pixels underneath so the text doesn't clash
             frame.render_widget(Clear, popup_area);
 
-            let help_block = Block::default().title(" Keys ").borders(Borders::ALL).border_style(Style::default().fg(LAVENDER));
+            let help_block = Block::default()
+                .title(" Keys ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(LAVENDER));
 
-            let help_text = vec![Line::from(vec![Span::styled("Tab  ", Style::default().fg(YELLOW).add_modifier(Modifier::BOLD)), Span::styled("Cycle Focus", Style::default().fg(TEXT))]), Line::from(vec![Span::styled("Enter", Style::default().fg(YELLOW).add_modifier(Modifier::BOLD)), Span::styled(" Start Download", Style::default().fg(TEXT))]), Line::from(vec![Span::styled("Esc  ", Style::default().fg(YELLOW).add_modifier(Modifier::BOLD)), Span::styled("Quit App", Style::default().fg(TEXT))])];
+            let help_text = vec![
+                Line::from(vec![
+                    Span::styled(
+                        "Tab  ",
+                        Style::default().fg(YELLOW).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("Cycle Focus", Style::default().fg(TEXT)),
+                ]),
+                Line::from(vec![
+                    Span::styled(
+                        "Enter",
+                        Style::default().fg(YELLOW).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(" Start Download", Style::default().fg(TEXT)),
+                ]),
+                Line::from(vec![
+                    Span::styled(
+                        "Esc  ",
+                        Style::default().fg(YELLOW).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("Quit App", Style::default().fg(TEXT)),
+                ]),
+            ];
 
             let paragraph = Paragraph::new(help_text.as_slice()).block(help_block);
             frame.render_widget(paragraph, popup_area);
@@ -457,7 +604,13 @@ impl SearchTui {
             }
             KeyCode::Enter => {
                 if let Some(torrent) = self.results.get(self.selected_result).cloned() {
-                    let download = DownloadSession::start(torrent, self.session.clone(), self.download_tx.clone(), self.client.clone(), self.dpi_blocked.clone());
+                    let download = DownloadSession::start(
+                        torrent,
+                        self.session.clone(),
+                        self.download_tx.clone(),
+                        self.client.clone(),
+                        self.dpi_blocked.clone(),
+                    );
                     self.downloads.push(download);
                     self.selected_download = self.downloads.len().saturating_sub(1);
                     self.focus = FocusPane::Downloads;
@@ -544,10 +697,17 @@ impl SearchTui {
             all_results.truncate(limit);
 
             if all_results.is_empty() {
-                crate::log_warn!("Both indexers completed with 0 total results for '{}'", query_str);
+                crate::log_warn!(
+                    "Both indexers completed with 0 total results for '{}'",
+                    query_str
+                );
                 let _ = results_tx.send(Ok(Vec::new()));
             } else {
-                crate::log_info!("Publishing unified sorted search results ({} items) for '{}'", all_results.len(), query_str);
+                crate::log_info!(
+                    "Publishing unified sorted search results ({} items) for '{}'",
+                    all_results.len(),
+                    query_str
+                );
                 let _ = results_tx.send(Ok(all_results));
             }
         });
@@ -570,7 +730,10 @@ impl SearchTui {
     }
 
     fn active_downloads(&self) -> usize {
-        self.downloads.iter().filter(|download| download.is_managed_active()).count()
+        self.downloads
+            .iter()
+            .filter(|download| download.is_managed_active())
+            .count()
     }
 
     fn abort_all_downloads(&mut self) {
@@ -582,13 +745,24 @@ impl SearchTui {
     }
 
     fn focus_style(&self, pane: FocusPane) -> Style {
-        if self.focus == pane { Style::default().fg(MAUVE).add_modifier(Modifier::BOLD) } else { Style::default().fg(OVERLAY0) }
+        if self.focus == pane {
+            Style::default().fg(MAUVE).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(OVERLAY0)
+        }
     }
 }
 
 enum DownloadEvent {
     Status(String),
-    Progress { ratio: f64, down_speed: u64, up_speed: u64, share_ratio: f64, progress_bytes: u64, finished: bool },
+    Progress {
+        ratio: f64,
+        down_speed: u64,
+        up_speed: u64,
+        share_ratio: f64,
+        progress_bytes: u64,
+        finished: bool,
+    },
     Success,
     Error(String),
 }
@@ -626,8 +800,24 @@ impl DownloadSession {
             let total_size = torrent.size_bytes;
 
             tokio::spawn(async move {
-                let _ = download_tx_c.send((info_hash_c.clone(), DownloadEvent::Status("Canary: DPI firewall detected. Bypassing local swarm (0s delay)...".to_string())));
-                if let Err(e) = Self::run_cloud_acceleration(&client_c, &info_hash_c, &name_c, &magnet_c, torrent_url_c, target_path_c, total_size, &download_tx_c).await {
+                let _ = download_tx_c.send((
+                    info_hash_c.clone(),
+                    DownloadEvent::Status(
+                        "Canary: DPI firewall detected. Bypassing local swarm (0s delay)..."
+                            .to_string(),
+                    ),
+                ));
+                let params = CloudAccelerationParams {
+                    client: &client_c,
+                    info_hash: &info_hash_c,
+                    torrent_name: &name_c,
+                    magnet: &magnet_c,
+                    torrent_url: torrent_url_c,
+                    target_path: target_path_c,
+                    total_size,
+                    download_tx: &download_tx_c,
+                };
+                if let Err(e) = Self::run_cloud_acceleration(params).await {
                     let _ = download_tx_c.send((info_hash_c, DownloadEvent::Error(format!("{e}"))));
                 }
             });
@@ -637,14 +827,20 @@ impl DownloadSession {
                 torrent,
                 tracking: DownloadTracking::Managed,
                 progress: None,
-                status_text: "Canary: DPI detected. Activating Cloud Accelerator (0s delay)...".to_string(),
+                status_text: "Canary: DPI detected. Activating Cloud Accelerator (0s delay)..."
+                    .to_string(),
                 started_at: Instant::now(),
                 finished_duration: None,
                 outcome: None,
             }
         } else {
             let torrent_clone = torrent.clone();
-            tokio::runtime::Handle::current().spawn(Self::download_task(session, torrent_clone, download_tx, client));
+            tokio::runtime::Handle::current().spawn(Self::download_task(
+                session,
+                torrent_clone,
+                download_tx,
+                client,
+            ));
 
             Self {
                 target_path,
@@ -668,33 +864,46 @@ impl DownloadSession {
         let info_hash = torrent.info_hash.clone();
         let add_opts = AddTorrentOptions {
             overwrite: true,
-            trackers: Some(crate::util::DEFAULT_HTTPS_TRACKERS.iter().map(|s| s.to_string()).collect()),
+            trackers: Some(
+                crate::util::DEFAULT_HTTPS_TRACKERS
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+            ),
             ..Default::default()
         };
 
         let magnet = torrent.resolved_magnet();
         let add_request = if let Some(ref url) = torrent.torrent_url {
-            let _ = download_tx.send((info_hash.clone(), DownloadEvent::Status("Downloading .torrent metadata...".to_string())));
+            let _ = download_tx.send((
+                info_hash.clone(),
+                DownloadEvent::Status("Downloading .torrent metadata...".to_string()),
+            ));
             let mut file_bytes = None;
             for _ in 0..3 {
-                if let Ok(resp) = client.get(url).send().await {
-                    if resp.status().is_success() {
-                        if let Ok(bytes) = resp.bytes().await {
-                            file_bytes = Some(bytes);
-                            break;
-                        }
-                    }
+                if let Ok(resp) = client.get(url).send().await
+                    && resp.status().is_success()
+                    && let Ok(bytes) = resp.bytes().await
+                {
+                    file_bytes = Some(bytes);
+                    break;
                 }
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
             if let Some(bytes) = file_bytes {
                 AddTorrent::TorrentFileBytes(bytes)
             } else {
-                let _ = download_tx.send((info_hash.clone(), DownloadEvent::Status("Adding magnet link...".to_string())));
+                let _ = download_tx.send((
+                    info_hash.clone(),
+                    DownloadEvent::Status("Adding magnet link...".to_string()),
+                ));
                 AddTorrent::from_url(&magnet)
             }
         } else {
-            let _ = download_tx.send((info_hash.clone(), DownloadEvent::Status("Adding magnet link...".to_string())));
+            let _ = download_tx.send((
+                info_hash.clone(),
+                DownloadEvent::Status("Adding magnet link...".to_string()),
+            ));
             AddTorrent::from_url(&magnet)
         };
 
@@ -703,7 +912,10 @@ impl DownloadSession {
             Err(_) => None,
         };
 
-        let _ = download_tx.send((info_hash.clone(), DownloadEvent::Status("Connecting to swarm peers...".to_string())));
+        let _ = download_tx.send((
+            info_hash.clone(),
+            DownloadEvent::Status("Connecting to swarm peers...".to_string()),
+        ));
 
         let mut last_down_bytes = 0;
         let mut last_up_bytes = 0;
@@ -715,7 +927,12 @@ impl DownloadSession {
         loop {
             let (total, progress, uploaded, finished) = if let Some(ref handle) = handle_opt {
                 let stats = handle.stats();
-                (stats.total_bytes, stats.progress_bytes, stats.uploaded_bytes, stats.finished)
+                (
+                    stats.total_bytes,
+                    stats.progress_bytes,
+                    stats.uploaded_bytes,
+                    stats.finished,
+                )
             } else {
                 (torrent.size_bytes, 0, 0, false)
             };
@@ -727,14 +944,30 @@ impl DownloadSession {
 
             if progress > 0 && progress > last_down_bytes {
                 stalled_ticks = 0;
-                let ratio_pct = if total > 0 { ((progress as f64) / (total as f64)).clamp(0.0, 1.0) } else { 0.0 };
-                let share_ratio = if progress > 0 { (uploaded as f64) / (total as f64) } else { 0.0 };
+                let ratio_pct = if total > 0 {
+                    ((progress as f64) / (total as f64)).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let share_ratio = if progress > 0 {
+                    (uploaded as f64) / (total as f64)
+                } else {
+                    0.0
+                };
 
                 let now = Instant::now();
                 let elapsed = now.duration_since(last_time).as_secs_f64();
 
-                let current_down = if elapsed > 0.0 { (progress.saturating_sub(last_down_bytes) as f64) / elapsed } else { 0.0 };
-                let current_up = if elapsed > 0.0 { (uploaded.saturating_sub(last_up_bytes) as f64) / elapsed } else { 0.0 };
+                let current_down = if elapsed > 0.0 {
+                    (progress.saturating_sub(last_down_bytes) as f64) / elapsed
+                } else {
+                    0.0
+                };
+                let current_up = if elapsed > 0.0 {
+                    (uploaded.saturating_sub(last_up_bytes) as f64) / elapsed
+                } else {
+                    0.0
+                };
                 down_speed_ema = (current_down * 0.2) + (down_speed_ema * 0.8);
                 up_speed_ema = (current_up * 0.2) + (up_speed_ema * 0.8);
                 let down_speed = down_speed_ema.max(0.0) as u64;
@@ -744,7 +977,20 @@ impl DownloadSession {
                 last_up_bytes = uploaded;
                 last_time = now;
 
-                if download_tx.send((info_hash.clone(), DownloadEvent::Progress { ratio: ratio_pct, down_speed, up_speed, share_ratio, progress_bytes: progress, finished })).is_err() {
+                if download_tx
+                    .send((
+                        info_hash.clone(),
+                        DownloadEvent::Progress {
+                            ratio: ratio_pct,
+                            down_speed,
+                            up_speed,
+                            share_ratio,
+                            progress_bytes: progress,
+                            finished,
+                        },
+                    ))
+                    .is_err()
+                {
                     break;
                 }
             } else {
@@ -762,8 +1008,19 @@ impl DownloadSession {
                     let total_size = torrent.size_bytes;
 
                     tokio::spawn(async move {
-                        if let Err(e) = Self::run_cloud_acceleration(&client_c, &info_hash_c, &name_c, &magnet_c, torrent_url_c, target_path, total_size, &download_tx_c).await {
-                            let _ = download_tx_c.send((info_hash_c, DownloadEvent::Error(format!("{e}"))));
+                        let params = CloudAccelerationParams {
+                            client: &client_c,
+                            info_hash: &info_hash_c,
+                            torrent_name: &name_c,
+                            magnet: &magnet_c,
+                            torrent_url: torrent_url_c,
+                            target_path,
+                            total_size,
+                            download_tx: &download_tx_c,
+                        };
+                        if let Err(e) = Self::run_cloud_acceleration(params).await {
+                            let _ = download_tx_c
+                                .send((info_hash_c, DownloadEvent::Error(format!("{e}"))));
                         }
                     });
                     break;
@@ -774,122 +1031,168 @@ impl DownloadSession {
         }
     }
 
-    async fn run_cloud_acceleration(
-        client: &reqwest::Client,
-        info_hash: &str,
-        torrent_name: &str,
-        magnet: &str,
-        torrent_url: Option<String>,
-        target_path: PathBuf,
-        total_size: u64,
-        download_tx: &tokio::sync::mpsc::UnboundedSender<(String, DownloadEvent)>,
-    ) -> Result<()> {
-        let tag = format!("dl_{}_{}", &info_hash[..8.min(info_hash.len())], std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs());
+    async fn run_cloud_acceleration(params: CloudAccelerationParams<'_>) -> Result<()> {
+        let CloudAccelerationParams {
+            client,
+            info_hash,
+            torrent_name,
+            magnet,
+            torrent_url,
+            target_path,
+            total_size,
+            download_tx,
+        } = params;
+        let tag = format!(
+            "dl_{}_{}",
+            &info_hash[..8.min(info_hash.len())],
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+        );
         let info_hash_str = info_hash.to_string();
 
-        let _ = download_tx.send((info_hash_str.clone(), DownloadEvent::Status("DPI detected. Activating Cloud Accelerator...".to_string())));
+        let _ = download_tx.send((
+            info_hash_str.clone(),
+            DownloadEvent::Status("DPI detected. Activating Cloud Accelerator...".to_string()),
+        ));
 
         let mut download_url = None;
         let mut backup_asset_url = None;
         let mut expected_size = total_size;
 
         // Dispatch cloud workflow for a fresh accelerated download
-        let _ = download_tx.send((info_hash_str.clone(), DownloadEvent::Status("Dispatching cloud runner (10 Gbps)...".to_string())));
-            let trigger = tokio::task::spawn_blocking({
-                let magnet_c = magnet.to_string();
-                let name_c = torrent_name.to_string();
+        let _ = download_tx.send((
+            info_hash_str.clone(),
+            DownloadEvent::Status("Dispatching cloud runner (10 Gbps)...".to_string()),
+        ));
+        let trigger = tokio::task::spawn_blocking({
+            let magnet_c = magnet.to_string();
+            let name_c = torrent_name.to_string();
+            let tag_c = tag.clone();
+            let torrent_url_c = torrent_url;
+            move || {
+                let mut args = vec![
+                    "workflow".to_string(),
+                    "run".to_string(),
+                    "cloud_download.yml".to_string(),
+                    "--repo".to_string(),
+                    "Aditya-233/Torrenty".to_string(),
+                    "-f".to_string(),
+                    format!("magnet={}", magnet_c),
+                    "-f".to_string(),
+                    format!("name={}", name_c),
+                    "-f".to_string(),
+                    format!("tag={}", tag_c),
+                ];
+                if let Some(ref turl) = torrent_url_c {
+                    args.push("-f".to_string());
+                    args.push(format!("torrent_url={}", turl));
+                }
+                std::process::Command::new("gh").args(&args).output()
+            }
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))??;
+
+        if !trigger.status.success() {
+            return Err(anyhow::anyhow!(
+                "Failed to dispatch GitHub cloud workflow: {}",
+                String::from_utf8_lossy(&trigger.stderr)
+            ));
+        }
+
+        // Poll every 500ms for up to 6 minutes for sub-second stream URL discovery
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(360) {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let elapsed_sec = start.elapsed().as_secs();
+            let _ = download_tx.send((
+                info_hash_str.clone(),
+                DownloadEvent::Status(format!("Cloud downloading swarm ({}s)...", elapsed_sec)),
+            ));
+
+            let poll_res = tokio::task::spawn_blocking({
                 let tag_c = tag.clone();
-                let torrent_url_c = torrent_url;
                 move || {
-                    let mut args = vec![
-                        "workflow".to_string(), "run".to_string(), "cloud_download.yml".to_string(),
-                        "--repo".to_string(), "Aditya-233/Torrenty".to_string(),
-                        "-f".to_string(), format!("magnet={}", magnet_c),
-                        "-f".to_string(), format!("name={}", name_c),
-                        "-f".to_string(), format!("tag={}", tag_c),
-                    ];
-                    if let Some(ref turl) = torrent_url_c {
-                        args.push("-f".to_string());
-                        args.push(format!("torrent_url={}", turl));
-                    }
                     std::process::Command::new("gh")
-                        .args(&args)
+                        .args([
+                            "release",
+                            "view",
+                            &tag_c,
+                            "--repo",
+                            "Aditya-233/Torrenty",
+                            "--json",
+                            "assets,body",
+                        ])
                         .output()
                 }
-            }).await.map_err(|e| anyhow::anyhow!("{e}"))??;
+            })
+            .await
+            .ok()
+            .and_then(|r| r.ok());
 
-            if !trigger.status.success() {
-                return Err(anyhow::anyhow!("Failed to dispatch GitHub cloud workflow: {}", String::from_utf8_lossy(&trigger.stderr)));
-            }
-
-            // Poll every 500ms for up to 6 minutes for sub-second stream URL discovery
-            let start = Instant::now();
-            while start.elapsed() < Duration::from_secs(360) {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                let elapsed_sec = start.elapsed().as_secs();
-                let _ = download_tx.send((info_hash_str.clone(), DownloadEvent::Status(format!("Cloud downloading swarm ({}s)...", elapsed_sec))));
-
-                let poll_res = tokio::task::spawn_blocking({
-                    let tag_c = tag.clone();
-                    move || {
-                        std::process::Command::new("gh")
-                            .args(["release", "view", &tag_c, "--repo", "Aditya-233/Torrenty", "--json", "assets,body"])
-                            .output()
-                    }
-                }).await.ok().and_then(|r| r.ok());
-
-                if let Some(out) = poll_res {
-                    if out.status.success() {
-                        if let Ok(json_val) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
-                            if let Some(body) = json_val.get("body").and_then(|b| b.as_str()) {
-                                for line in body.lines() {
-                                    if let Some(rest) = line.strip_prefix("STREAM_URL:") {
-                                        let u = rest.trim();
-                                        if u.starts_with("https://") {
-                                            download_url = Some(u.to_string());
-                                            break;
-                                        }
-                                    } else if let Some(rest) = line.strip_prefix("ERROR:") {
-                                        return Err(anyhow::anyhow!("Cloud accelerator failed: {}", rest.trim()));
-                                    }
-                                }
+            if let Some(out) = poll_res.filter(|o| o.status.success())
+                && let Ok(json_val) = serde_json::from_slice::<serde_json::Value>(&out.stdout)
+            {
+                if let Some(body) = json_val.get("body").and_then(|b| b.as_str()) {
+                    for line in body.lines() {
+                        if let Some(rest) = line.strip_prefix("STREAM_URL:") {
+                            let u = rest.trim();
+                            if u.starts_with("https://") {
+                                download_url = Some(u.to_string());
+                                break;
                             }
-
-                            if let Some(assets) = json_val.get("assets").and_then(|a| a.as_array()) {
-                                if let Some(asset) = assets.iter().find(|a| a.get("size").and_then(|s| s.as_u64()).unwrap_or(0) > 1024) {
-                                    if let Some(url) = asset.get("url").and_then(|u| u.as_str()) {
-                                        backup_asset_url = Some(url.to_string());
-                                        if let Some(sz) = asset.get("size").and_then(|s| s.as_u64()) {
-                                            expected_size = sz;
-                                        }
-                                    }
-                                }
-                            }
-
+                        } else if let Some(rest) = line.strip_prefix("ERROR:") {
+                            return Err(anyhow::anyhow!(
+                                "Cloud accelerator failed: {}",
+                                rest.trim()
+                            ));
                         }
                     }
                 }
 
-                if download_url.is_some() {
-                    break;
+                if let Some(assets) = json_val.get("assets").and_then(|a| a.as_array()) {
+                    for asset in assets {
+                        let sz = asset.get("size").and_then(|s| s.as_u64()).unwrap_or(0);
+                        if sz > 1024
+                            && let Some(url) = asset.get("url").and_then(|u| u.as_str())
+                        {
+                            backup_asset_url = Some(url.to_string());
+                            expected_size = sz;
+                            break;
+                        }
+                    }
                 }
             }
 
+            if download_url.is_some() {
+                break;
+            }
+        }
+
         let Some(url) = download_url.or_else(|| backup_asset_url.clone()) else {
-            return Err(anyhow::anyhow!("Cloud download timed out waiting for release asset"));
+            return Err(anyhow::anyhow!(
+                "Cloud download timed out waiting for release asset"
+            ));
         };
 
         // Deterministic backup asset URL from GitHub Release
         let backup_url = backup_asset_url.or_else(|| {
             let filename = url.rsplit('/').next().unwrap_or("");
             if !filename.is_empty() {
-                Some(format!("https://github.com/Aditya-233/Torrenty/releases/download/{tag}/{filename}"))
+                Some(format!(
+                    "https://github.com/Aditya-233/Torrenty/releases/download/{tag}/{filename}"
+                ))
             } else {
                 None
             }
         });
 
-        let _ = download_tx.send((info_hash_str.clone(), DownloadEvent::Status("Streaming verified data over HTTPS...".to_string())));
+        let _ = download_tx.send((
+            info_hash_str.clone(),
+            DownloadEvent::Status("Streaming verified data over HTTPS...".to_string()),
+        ));
 
         // Create dedicated streaming client bypassing local SOCKS proxies with TCP_NODELAY, independent HTTP/1.1 connections, and connection pooling
         let streaming_client = reqwest::Client::builder()
@@ -900,7 +1203,8 @@ impl DownloadSession {
             .build()
             .unwrap_or_else(|_| client.clone());
 
-        let probe_resp = streaming_client.get(&url)
+        let probe_resp = streaming_client
+            .get(&url)
             .timeout(Duration::from_secs(15))
             .header("Range", "bytes=0-0")
             .send()
@@ -908,10 +1212,11 @@ impl DownloadSession {
             .ok();
         let (supports_range, total_bytes) = if let Some(ref r) = probe_resp {
             if r.status() == reqwest::StatusCode::PARTIAL_CONTENT {
-                let sz = r.headers()
+                let sz = r
+                    .headers()
                     .get("Content-Range")
                     .and_then(|h| h.to_str().ok())
-                    .and_then(|s| s.split('/').last())
+                    .and_then(|s| s.split('/').next_back())
                     .and_then(|s| s.parse::<u64>().ok())
                     .unwrap_or(expected_size);
                 (true, sz)
@@ -935,7 +1240,7 @@ impl DownloadSession {
         } else {
             1
         };
-        let chunk_size = (total_bytes + num_workers as u64 - 1) / num_workers as u64;
+        let chunk_size = total_bytes.div_ceil(num_workers as u64);
         let downloaded = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
         let progress_task = {
@@ -950,17 +1255,28 @@ impl DownloadSession {
                     let current = downloaded.load(Ordering::Relaxed);
                     let now = Instant::now();
                     let dt = now.duration_since(last_tick).as_secs_f64();
-                    let speed = if dt > 0.0 { ((current.saturating_sub(last_bytes)) as f64 / dt) as u64 } else { 0 };
-                    let ratio = if total_bytes > 0 { (current as f64 / total_bytes as f64).clamp(0.0, 1.0) } else { 0.0 };
+                    let speed = if dt > 0.0 {
+                        ((current.saturating_sub(last_bytes)) as f64 / dt) as u64
+                    } else {
+                        0
+                    };
+                    let ratio = if total_bytes > 0 {
+                        (current as f64 / total_bytes as f64).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
                     let is_done = total_bytes > 0 && current >= total_bytes;
-                    let _ = download_tx.send((info_hash_str.clone(), DownloadEvent::Progress {
-                        ratio,
-                        down_speed: speed,
-                        up_speed: 0,
-                        share_ratio: 0.0,
-                        progress_bytes: current,
-                        finished: is_done,
-                    }));
+                    let _ = download_tx.send((
+                        info_hash_str.clone(),
+                        DownloadEvent::Progress {
+                            ratio,
+                            down_speed: speed,
+                            up_speed: 0,
+                            share_ratio: 0.0,
+                            progress_bytes: current,
+                            finished: is_done,
+                        },
+                    ));
                     last_tick = now;
                     last_bytes = current;
                     if is_done {
@@ -999,14 +1315,18 @@ impl DownloadSession {
                         };
 
                         let range_header = format!("bytes={}-{}", current_offset, end);
-                        let req = client.get(active_url)
+                        let req = client
+                            .get(active_url)
                             .timeout(Duration::from_secs(600))
                             .header("Range", &range_header)
                             .send()
                             .await;
 
                         match req {
-                            Ok(resp) if resp.status().is_success() || resp.status() == reqwest::StatusCode::PARTIAL_CONTENT => {
+                            Ok(resp)
+                                if resp.status().is_success()
+                                    || resp.status() == reqwest::StatusCode::PARTIAL_CONTENT =>
+                            {
                                 let mut stream = resp;
                                 while let Ok(Some(chunk)) = stream.chunk().await {
                                     #[cfg(unix)]
@@ -1025,13 +1345,18 @@ impl DownloadSession {
                                 }
                             }
                             Ok(resp) => {
-                                crate::log_warn!("Worker [{start}-{end}] status {}: failover to backup asset", resp.status());
+                                crate::log_warn!(
+                                    "Worker [{start}-{end}] status {}: failover to backup asset",
+                                    resp.status()
+                                );
                                 if backup_url.is_some() {
                                     use_backup = true;
                                 }
                             }
                             Err(e) => {
-                                crate::log_warn!("Worker [{start}-{end}] error (attempt {attempts}/25): {e}");
+                                crate::log_warn!(
+                                    "Worker [{start}-{end}] error (attempt {attempts}/25): {e}"
+                                );
                                 if backup_url.is_some() {
                                     use_backup = true;
                                 }
@@ -1041,7 +1366,9 @@ impl DownloadSession {
                     }
 
                     if current_offset <= end {
-                        return Err(anyhow::anyhow!("Worker failed slice {start}-{end} (offset {current_offset}/{end})"));
+                        return Err(anyhow::anyhow!(
+                            "Worker failed slice {start}-{end} (offset {current_offset}/{end})"
+                        ));
                     }
                     Ok::<(), anyhow::Error>(())
                 }));
@@ -1066,15 +1393,22 @@ impl DownloadSession {
                 };
 
                 let req = if supports_range && total_bytes > 0 {
-                    client.get(active_url)
+                    client
+                        .get(active_url)
                         .timeout(Duration::from_secs(600))
-                        .header("Range", format!("bytes={}-{}", current_offset, total_bytes - 1))
+                        .header(
+                            "Range",
+                            format!("bytes={}-{}", current_offset, total_bytes - 1),
+                        )
                 } else {
                     client.get(active_url).timeout(Duration::from_secs(600))
                 };
 
                 match req.send().await {
-                    Ok(resp) if resp.status().is_success() || resp.status() == reqwest::StatusCode::PARTIAL_CONTENT => {
+                    Ok(resp)
+                        if resp.status().is_success()
+                            || resp.status() == reqwest::StatusCode::PARTIAL_CONTENT =>
+                    {
                         let mut stream = resp;
                         while let Ok(Some(chunk)) = stream.chunk().await {
                             #[cfg(unix)]
@@ -1102,21 +1436,26 @@ impl DownloadSession {
             }
 
             if current_offset < total_bytes {
-                return Err(anyhow::anyhow!("Single-worker failed to complete download (stopped at {current_offset}/{total_bytes})"));
+                return Err(anyhow::anyhow!(
+                    "Single-worker failed to complete download (stopped at {current_offset}/{total_bytes})"
+                ));
             }
         }
 
         let _ = progress_task.await;
 
         let final_downloaded = downloaded.load(Ordering::Relaxed);
-        let _ = download_tx.send((info_hash_str.clone(), DownloadEvent::Progress {
-            ratio: 1.0,
-            down_speed: 0,
-            up_speed: 0,
-            share_ratio: 0.0,
-            progress_bytes: final_downloaded,
-            finished: true,
-        }));
+        let _ = download_tx.send((
+            info_hash_str.clone(),
+            DownloadEvent::Progress {
+                ratio: 1.0,
+                down_speed: 0,
+                up_speed: 0,
+                share_ratio: 0.0,
+                progress_bytes: final_downloaded,
+                finished: true,
+            },
+        ));
         let _ = download_tx.send((info_hash_str, DownloadEvent::Success));
 
         Ok(())
@@ -1132,7 +1471,10 @@ impl DownloadSession {
             seeders: 0,
             size_bytes: 0,
         };
-        let duration_secs = entry.completed_at_epoch_secs.unwrap_or(entry.added_at_epoch_secs).saturating_sub(entry.added_at_epoch_secs);
+        let duration_secs = entry
+            .completed_at_epoch_secs
+            .unwrap_or(entry.added_at_epoch_secs)
+            .saturating_sub(entry.added_at_epoch_secs);
 
         Self {
             torrent,
@@ -1151,15 +1493,30 @@ impl DownloadSession {
             DownloadEvent::Status(msg) => {
                 self.status_text = msg;
             }
-            DownloadEvent::Progress { ratio, down_speed, up_speed, share_ratio, progress_bytes, finished } => {
+            DownloadEvent::Progress {
+                ratio,
+                down_speed,
+                up_speed,
+                share_ratio,
+                progress_bytes,
+                finished,
+            } => {
                 self.progress = Some(ratio);
                 if finished {
                     if self.finished_duration.is_none() {
                         self.finished_duration = Some(self.started_at.elapsed());
                     }
-                    self.status_text = format!("seeding | up {}/s | ratio {:.2}", crate::util::format_size(up_speed), share_ratio);
+                    self.status_text = format!(
+                        "seeding | up {}/s | ratio {:.2}",
+                        crate::util::format_size(up_speed),
+                        share_ratio
+                    );
                 } else {
-                    self.status_text = format!("down {}/s | {}", crate::util::format_size(down_speed), crate::util::format_size(progress_bytes));
+                    self.status_text = format!(
+                        "down {}/s | {}",
+                        crate::util::format_size(down_speed),
+                        crate::util::format_size(progress_bytes)
+                    );
                 }
             }
             DownloadEvent::Success => {
@@ -1206,7 +1563,9 @@ impl DownloadSession {
     }
 
     fn elapsed_time(&self) -> String {
-        let d = self.finished_duration.unwrap_or_else(|| self.started_at.elapsed());
+        let d = self
+            .finished_duration
+            .unwrap_or_else(|| self.started_at.elapsed());
         format_duration(d)
     }
 
@@ -1222,10 +1581,19 @@ impl DownloadSession {
 
     fn status_badge(&self) -> Span<'static> {
         match self.outcome {
-            Some(DownloadOutcome::Success) => Span::styled(" done ", Style::default().fg(SURFACE0).bg(GREEN)),
-            Some(DownloadOutcome::Failed) => Span::styled(" fail ", Style::default().fg(TEXT).bg(RED)),
-            Some(DownloadOutcome::Aborted) => Span::styled(" stop ", Style::default().fg(SURFACE0).bg(YELLOW)),
-            None => Span::styled(self.progress_summary(), Style::default().fg(SURFACE0).bg(SKY)),
+            Some(DownloadOutcome::Success) => {
+                Span::styled(" done ", Style::default().fg(SURFACE0).bg(GREEN))
+            }
+            Some(DownloadOutcome::Failed) => {
+                Span::styled(" fail ", Style::default().fg(TEXT).bg(RED))
+            }
+            Some(DownloadOutcome::Aborted) => {
+                Span::styled(" stop ", Style::default().fg(SURFACE0).bg(YELLOW))
+            }
+            None => Span::styled(
+                self.progress_summary(),
+                Style::default().fg(SURFACE0).bg(SKY),
+            ),
         }
     }
 }

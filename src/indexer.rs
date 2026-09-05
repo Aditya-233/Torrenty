@@ -81,15 +81,25 @@ pub fn build_client() -> Result<Client> {
 }
 
 pub async fn search_piratebay(client: &Client, query: &str, limit: usize) -> Result<Vec<Torrent>> {
-    crate::log_info!("Starting PirateBay search for query='{}', limit={}", query, limit);
+    crate::log_info!(
+        "Starting PirateBay search for query='{}', limit={}",
+        query,
+        limit
+    );
     let start = std::time::Instant::now();
-    let req = client.get("https://apibay.org/q.php").query(&[("q", query)]);
+    let req = client
+        .get("https://apibay.org/q.php")
+        .query(&[("q", query)]);
 
     let send_res = tokio::time::timeout(std::time::Duration::from_secs(4), req.send()).await;
     match send_res {
         Ok(Ok(resp)) => {
             let status = resp.status();
-            crate::log_info!("PirateBay HTTP response status={} (elapsed: {:?})", status, start.elapsed());
+            crate::log_info!(
+                "PirateBay HTTP response status={} (elapsed: {:?})",
+                status,
+                start.elapsed()
+            );
             if !status.is_success() {
                 crate::log_warn!("PirateBay non-success response: {}", status);
                 return Ok(Vec::new());
@@ -101,7 +111,11 @@ pub async fn search_piratebay(client: &Client, query: &str, limit: usize) -> Res
                     return Ok(Vec::new());
                 }
             };
-            crate::log_info!("PirateBay received {} bytes in {:?}", bytes.len(), start.elapsed());
+            crate::log_info!(
+                "PirateBay received {} bytes in {:?}",
+                bytes.len(),
+                start.elapsed()
+            );
             let items: Vec<ApiTorrent> = match serde_json::from_slice(&bytes) {
                 Ok(it) => it,
                 Err(e) => {
@@ -112,20 +126,37 @@ pub async fn search_piratebay(client: &Client, query: &str, limit: usize) -> Res
 
             let results: Vec<Torrent> = items
                 .into_iter()
-                .filter(|item| item.id != "0" && item.info_hash.as_deref().is_some_and(|hash| !hash.trim().is_empty()))
+                .filter(|item| {
+                    item.id != "0"
+                        && item
+                            .info_hash
+                            .as_deref()
+                            .is_some_and(|hash| !hash.trim().is_empty())
+                })
                 .map(Torrent::from)
                 .take(limit)
                 .collect();
 
-            crate::log_info!("PirateBay parsed {} torrents in {:?}", results.len(), start.elapsed());
+            crate::log_info!(
+                "PirateBay parsed {} torrents in {:?}",
+                results.len(),
+                start.elapsed()
+            );
             Ok(results)
         }
         Ok(Err(e)) => {
-            crate::log_warn!("PirateBay request failed: {:#} (elapsed: {:?})", e, start.elapsed());
+            crate::log_warn!(
+                "PirateBay request failed: {:#} (elapsed: {:?})",
+                e,
+                start.elapsed()
+            );
             Ok(Vec::new())
         }
         Err(_) => {
-            crate::log_warn!("PirateBay request timed out after 4s (elapsed: {:?})", start.elapsed());
+            crate::log_warn!(
+                "PirateBay request timed out after 4s (elapsed: {:?})",
+                start.elapsed()
+            );
             Ok(Vec::new())
         }
     }
@@ -160,21 +191,32 @@ impl From<ApiTorrent> for Torrent {
 }
 
 pub async fn search_nyaa(client: &Client, query: &str, limit: usize) -> Result<Vec<Torrent>> {
-    crate::log_info!("Starting Nyaa.si search for query='{}', limit={}", query, limit);
+    crate::log_info!(
+        "Starting Nyaa.si search for query='{}', limit={}",
+        query,
+        limit
+    );
     let start = std::time::Instant::now();
     let mut last_err = None;
 
     for attempt in 1..=3 {
         crate::log_info!("Nyaa attempt {}/3 for query='{}'", attempt, query);
-        let req = client
-            .get("https://nyaa.si/?page=rss")
-            .query(&[("q", query), ("c", "0_0"), ("f", "0")]);
+        let req = client.get("https://nyaa.si/?page=rss").query(&[
+            ("q", query),
+            ("c", "0_0"),
+            ("f", "0"),
+        ]);
 
         let send_res = tokio::time::timeout(std::time::Duration::from_secs(6), req.send()).await;
         match send_res {
             Ok(Ok(resp)) => {
                 let status = resp.status();
-                crate::log_info!("Nyaa attempt {} HTTP status={} (elapsed: {:?})", attempt, status, start.elapsed());
+                crate::log_info!(
+                    "Nyaa attempt {} HTTP status={} (elapsed: {:?})",
+                    attempt,
+                    status,
+                    start.elapsed()
+                );
                 match resp.error_for_status() {
                     Ok(response) => {
                         let body = match response.text().await {
@@ -185,22 +227,37 @@ pub async fn search_nyaa(client: &Client, query: &str, limit: usize) -> Result<V
                                 continue;
                             }
                         };
-                        crate::log_info!("Nyaa body received: {} bytes in {:?}", body.len(), start.elapsed());
+                        crate::log_info!(
+                            "Nyaa body received: {} bytes in {:?}",
+                            body.len(),
+                            start.elapsed()
+                        );
                         let mut results = Vec::new();
                         for item_str in body.split("<item>").skip(1) {
                             let end = item_str.find("</item>").unwrap_or(item_str.len());
                             let item_xml = &item_str[..end];
 
-                            let name = extract_xml_tag(item_xml, "<title>", "</title>").unwrap_or_default().to_string();
-                            let info_hash = extract_xml_tag(item_xml, "<nyaa:infoHash>", "</nyaa:infoHash>").unwrap_or_default().to_string();
+                            let name = extract_xml_tag(item_xml, "<title>", "</title>")
+                                .unwrap_or_default()
+                                .to_string();
+                            let info_hash =
+                                extract_xml_tag(item_xml, "<nyaa:infoHash>", "</nyaa:infoHash>")
+                                    .unwrap_or_default()
+                                    .to_string();
                             if info_hash.is_empty() {
                                 continue;
                             }
 
-                            let torrent_url = extract_xml_tag(item_xml, "<link>", "</link>").map(|s| s.to_string());
-                            let size_str = extract_xml_tag(item_xml, "<nyaa:size>", "</nyaa:size>").unwrap_or_default();
+                            let torrent_url = extract_xml_tag(item_xml, "<link>", "</link>")
+                                .map(|s| s.to_string());
+                            let size_str = extract_xml_tag(item_xml, "<nyaa:size>", "</nyaa:size>")
+                                .unwrap_or_default();
                             let size_bytes = parse_nyaa_size(size_str);
-                            let seeders = extract_xml_tag(item_xml, "<nyaa:seeders>", "</nyaa:seeders>").unwrap_or_default().parse().unwrap_or(0);
+                            let seeders =
+                                extract_xml_tag(item_xml, "<nyaa:seeders>", "</nyaa:seeders>")
+                                    .unwrap_or_default()
+                                    .parse()
+                                    .unwrap_or(0);
                             let magnet = Some(crate::util::build_magnet_link(&info_hash, &name));
 
                             results.push(Torrent {
@@ -216,7 +273,11 @@ pub async fn search_nyaa(client: &Client, query: &str, limit: usize) -> Result<V
                                 break;
                             }
                         }
-                        crate::log_info!("Nyaa parsed {} torrents in {:?}", results.len(), start.elapsed());
+                        crate::log_info!(
+                            "Nyaa parsed {} torrents in {:?}",
+                            results.len(),
+                            start.elapsed()
+                        );
                         return Ok(results);
                     }
                     Err(e) => {
@@ -226,11 +287,18 @@ pub async fn search_nyaa(client: &Client, query: &str, limit: usize) -> Result<V
                 }
             }
             Ok(Err(e)) => {
-                crate::log_warn!("Nyaa connection error: {:#} (elapsed: {:?})", e, start.elapsed());
+                crate::log_warn!(
+                    "Nyaa connection error: {:#} (elapsed: {:?})",
+                    e,
+                    start.elapsed()
+                );
                 last_err = Some(anyhow::anyhow!(e));
             }
             Err(_) => {
-                crate::log_warn!("Nyaa request timed out after 6s (elapsed: {:?})", start.elapsed());
+                crate::log_warn!(
+                    "Nyaa request timed out after 6s (elapsed: {:?})",
+                    start.elapsed()
+                );
                 last_err = Some(anyhow::anyhow!("request timed out after 6s"));
             }
         }
@@ -246,12 +314,21 @@ fn extract_xml_tag<'a>(xml: &'a str, start_tag: &str, end_tag: &str) -> Option<&
     let start = xml.find(start_tag)? + start_tag.len();
     let end = xml[start..].find(end_tag)?;
     let content = &xml[start..start + end];
-    if content.starts_with("<![CDATA[") && content.ends_with("]]>") { Some(&content[9..content.len() - 3]) } else { Some(content) }
+    if content.starts_with("<![CDATA[") && content.ends_with("]]>") {
+        Some(&content[9..content.len() - 3])
+    } else {
+        Some(content)
+    }
 }
 
 fn parse_nyaa_size(size_str: &str) -> u64 {
     let s = size_str.trim().to_lowercase();
-    let val: f64 = s.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect::<String>().parse().unwrap_or(0.0);
+    let val: f64 = s
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect::<String>()
+        .parse()
+        .unwrap_or(0.0);
     let mult = if s.contains("tib") || s.contains("tb") {
         1024.0 * 1024.0 * 1024.0 * 1024.0
     } else if s.contains("gib") || s.contains("gb") {

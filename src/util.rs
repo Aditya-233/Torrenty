@@ -56,7 +56,9 @@ pub fn build_magnet_link(info_hash: &str, name: &str) -> String {
     let mut magnet = format!("magnet:?xt=urn:btih:{info_hash}&dn=");
     for b in name.bytes() {
         match b {
-            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => magnet.push(b as char),
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                magnet.push(b as char)
+            }
             _ => {
                 let _ = write!(magnet, "%{b:02X}");
             }
@@ -69,10 +71,13 @@ pub fn build_magnet_link(info_hash: &str, name: &str) -> String {
 }
 
 pub fn parse_string<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
-    parse_opt_string(d).and_then(|opt| opt.ok_or_else(|| serde::de::Error::custom("expected string")))
+    parse_opt_string(d)
+        .and_then(|opt| opt.ok_or_else(|| serde::de::Error::custom("expected string")))
 }
 
-pub fn parse_opt_string<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+pub fn parse_opt_string<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<String>, D::Error> {
     let v = serde_json::Value::deserialize(d)?;
     Ok(match v {
         serde_json::Value::String(s) if !s.trim().is_empty() => Some(s),
@@ -97,13 +102,19 @@ use std::sync::Mutex;
 static LOG_MUTEX: Mutex<()> = Mutex::new(());
 
 pub fn log(level: &str, msg: &str) {
-    let _guard = LOG_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-    let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_else(|_| ".".to_string());
+    let _guard = LOG_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| ".".to_string());
     let dir = std::path::PathBuf::from(home).join(".cache/torrentty");
     let _ = std::fs::create_dir_all(&dir);
     let log_file = dir.join("torrentty.log");
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(log_file) {
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
         let secs = now.as_secs();
         let millis = now.subsec_millis();
         let _ = writeln!(f, "[{secs}.{millis:03}] [{level}] {msg}");
@@ -137,4 +148,3 @@ macro_rules! log_debug {
         $crate::util::log("DEBUG", &format!($($arg)*))
     };
 }
-

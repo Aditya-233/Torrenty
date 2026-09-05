@@ -26,7 +26,9 @@ pub fn default_download_dir() -> PathBuf {
 
 #[must_use]
 pub fn history_path() -> PathBuf {
-    let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_default();
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_default();
     PathBuf::from(home).join(".cache/torrentty/download-history.json")
 }
 
@@ -36,7 +38,10 @@ pub fn load_history(path: &Path) -> Result<Vec<DownloadHistoryEntry>> {
     };
     let reader = std::io::BufReader::new(file);
     let entries: Vec<DownloadHistoryEntry> = serde_json::from_reader(reader)?;
-    Ok(entries.into_iter().filter(|e| e.completed_at_epoch_secs.is_none() || e.target_path.exists()).collect())
+    Ok(entries
+        .into_iter()
+        .filter(|e| e.completed_at_epoch_secs.is_none() || e.target_path.exists())
+        .collect())
 }
 
 pub fn upsert_history(path: &Path, entry: DownloadHistoryEntry) -> Result<()> {
@@ -57,5 +62,8 @@ pub fn upsert_history(path: &Path, entry: DownloadHistoryEntry) -> Result<()> {
 
 #[must_use]
 pub fn now_epoch_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }

@@ -11,6 +11,8 @@ pub struct Torrent {
 impl Torrent {
     #[must_use]
     pub fn resolved_magnet(&self) -> String {
-        self.magnet.clone().unwrap_or_else(|| crate::util::build_magnet_link(&self.info_hash, &self.name))
+        self.magnet
+            .clone()
+            .unwrap_or_else(|| crate::util::build_magnet_link(&self.info_hash, &self.name))
     }
 }

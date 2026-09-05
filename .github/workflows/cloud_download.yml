@@ -72,8 +72,11 @@ jobs:
 
           # Launch Python Multi-Threaded Range Server (RFC-7233) with zero-copy sendfile
           python3 -c "
-          import os, functools, time, socket
-          from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
+          import functools
+          import os
+          import socket
+          import time
+          from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
           class RangeRequestHandler(SimpleHTTPRequestHandler):
               def send_head(self):

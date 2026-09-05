@@ -3,6 +3,13 @@ name = "torrentty"
 version = "1.0.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
+description = "Ultra-fast terminal BitTorrent client with asymmetric cloud swarm acceleration"
+repository = "https://github.com/Aditya-233/Torrenty"
+homepage = "https://github.com/Aditya-233/Torrenty"
+readme = "README.md"
+authors = ["Aditya <https://github.com/Aditya-233>"]
+keywords = ["torrent", "bittorrent", "tui", "ratatui", "accelerator"]
+categories = ["command-line-utilities", "network-programming"]
 
 [dependencies]
 anyhow = "1.0"
