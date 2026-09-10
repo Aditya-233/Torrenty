@@ -281,9 +281,14 @@ jobs:
           # Upload to GitHub Release as permanent backup while client streams via tunnel
           UPLOAD_PID=""
           if [ -n "$TARGET_FILE" ]; then
-            echo "Starting GitHub release backup upload in background..."
-            gh release upload "$TAG" "$TARGET_FILE" --repo "$REPO" --clobber &
-            UPLOAD_PID=$!
+            FILE_SIZE=$(stat -c%s "$TARGET_FILE")
+            if [ "$FILE_SIZE" -lt 2147483648 ]; then
+              echo "Starting GitHub release backup upload in background..."
+              gh release upload "$TAG" "$TARGET_FILE" --repo "$REPO" --clobber &
+              UPLOAD_PID=$!
+            else
+              echo "File exceeds 2GB GitHub limit. Skipping upload, holding tunnel open."
+            fi
           fi
 
           echo "Holding stream tunnel active for client streaming..."
@@ -293,9 +298,9 @@ jobs:
             NOW=$(date +%s)
             ELAPSED=$((NOW - START_HOLD))
 
-            # 1. Hard safety ceiling: 25 minutes (1500 seconds)
-            if [ "$ELAPSED" -gt 1500 ]; then
-              echo "Max stream hold time reached (25m). Completing job."
+            # 1. Hard safety ceiling: 45 minutes (2700 seconds)
+            if [ "$ELAPSED" -gt 2700 ]; then
+              echo "Max stream hold time reached (45m). Completing job."
               break
             fi
 
@@ -312,13 +317,13 @@ jobs:
             if [ -f /tmp/last_transfer ]; then
               LAST_ACTIVE=$(stat -c %Y /tmp/last_transfer 2>/dev/null || echo "$NOW")
               IDLE=$((NOW - LAST_ACTIVE))
-              if [ "$IDLE" -gt 75 ] && [ "$ELAPSED" -gt 120 ] && [ "$UPLOAD_DONE" -eq 1 ]; then
-                echo "Stream idle for ${IDLE}s after active transfer and backup upload complete. Completing job."
+              if [ "$IDLE" -gt 2700 ] && [ "$ELAPSED" -gt 120 ] && [ "$UPLOAD_DONE" -eq 1 ]; then
+                echo "Stream idle for ${IDLE}s. Completing job."
                 break
               fi
             else
-              if [ "$ELAPSED" -gt 300 ] && [ "$UPLOAD_DONE" -eq 1 ]; then
-                echo "No stream requests received within 5m. Completing job."
+              if [ "$ELAPSED" -gt 2700 ] && [ "$UPLOAD_DONE" -eq 1 ]; then
+                echo "No stream requests received within 45m. Completing job."
                 break
               fi
             fi
