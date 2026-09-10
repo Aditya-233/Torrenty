@@ -1,339 +1,72 @@
-name: Cloud Torrent Download
+name: Release
 
 on:
+  push:
+    tags:
+      - "v*"
   workflow_dispatch:
-    inputs:
-      magnet:
-        description: "Magnet URI or InfoHash"
-        required: true
-      name:
-        description: "Torrent file or item name"
-        required: true
-      tag:
-        description: "Release tag to upload to"
-        default: "proof"
-      torrent_url:
-        description: "Direct .torrent URL if available"
-        required: false
-        default: ""
 
 permissions:
   contents: write
 
 jobs:
-  download:
-    name: Fast Cloud Download
-    runs-on: ubuntu-latest
+  release:
+    name: Build & Release (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary_name: torrentty
+            asset_name: torrentty-linux-x86_64.tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            binary_name: torrentty
+            asset_name: torrentty-macos-arm64.tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary_name: torrentty.exe
+            asset_name: torrentty-windows-x86_64.zip
+
     steps:
-      - name: Maximize Runner Disk Space
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package binary (Unix)
+        if: runner.os != 'Windows'
         run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          cd target/${{ matrix.target }}/release
+          tar -czf ../../../${{ matrix.asset_name }} ${{ matrix.binary_name }}
 
-      - name: Restore Tools Cache
-        uses: actions/cache/restore@v4
-        id: cache-tools
-        with:
-          path: |
-            /usr/local/bin/aria2c
-            /usr/local/bin/cloudflared
-          key: cloud-tools-musl-v2
-
-      - name: Fast Zero-Install Tooling
-        if: steps.cache-tools.outputs.cache-hit != 'true'
+      - name: Package binary (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
         run: |
-          echo "Installing cloud accelerator tools in parallel..."
-          sudo curl -sLo /usr/local/bin/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 && sudo chmod +x /usr/local/bin/cloudflared &
-          (curl -sLo /tmp/aria2.tar.gz https://github.com/P3TERX/Aria2-Pro-Core/releases/latest/download/aria2-1.37.0-static-linux-amd64.tar.gz && tar -xzf /tmp/aria2.tar.gz -C /tmp && sudo mv /tmp/aria2c /usr/local/bin/ && sudo chmod +x /usr/local/bin/aria2c) || sudo apt-get install -y --no-install-recommends aria2 &
-          wait
-          echo "Tooling ready: aria2, cloudflared"
+          cd target/${{ matrix.target }}/release
+          7z a ../../../${{ matrix.asset_name }} ${{ matrix.binary_name }}
 
-      - name: Save Tools Cache
-        if: steps.cache-tools.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            /usr/local/bin/aria2c
-            /usr/local/bin/cloudflared
-          key: cloud-tools-musl-v2
-
-      - name: Restore DHT Routing Table
-        uses: actions/cache/restore@v4
-        with:
-          path: /home/runner/.cache/aria2
-          key: dht-cache-${{ github.run_id }}
-          restore-keys: |
-            dht-cache-
-
-      - name: Extreme Accelerated Torrent Download & Stream
+      - name: Publish asset to GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          DL_DIR: ${{ github.workspace }}/dl
+        shell: bash
         run: |
-          # Initialize DHT directory and disk workspace
-          mkdir -p /home/runner/.cache/aria2
-          mkdir -p "$DL_DIR"
-          cd "$DL_DIR"
-          echo "Starting accelerated download for ${{ inputs.name }} on disk workspace..."
-
-          # Launch Python Multi-Threaded Range Server (RFC-7233) with zero-copy sendfile
-          python3 -c "
-          import functools
-          import os
-          import socket
-          import time
-          from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
-
-          dl_path = os.environ.get('DL_DIR', '/tmp/dl')
-
-          class RangeRequestHandler(SimpleHTTPRequestHandler):
-              def send_head(self):
-                  path = self.translate_path(self.path)
-                  if not os.path.isfile(path):
-                      return super().send_head()
-                  f = open(path, 'rb')
-                  size = os.fstat(f.fileno()).st_size
-                  range_header = self.headers.get('Range')
-                  if not range_header:
-                      return super().send_head()
-                  try:
-                      val = range_header.strip().lower()
-                      if val.startswith('bytes='):
-                          val = val[6:].split(',')[0].strip()
-                          start_str, end_str = val.split('-')
-                          start = int(start_str) if start_str else 0
-                          end = int(end_str) if end_str else size - 1
-                          if start >= size or start > end:
-                              self.send_error(416, 'Range Not Satisfiable')
-                              f.close()
-                              return None
-                          self.send_response(206)
-                          self.send_header('Content-Type', self.guess_type(path))
-                          self.send_header('Content-Range', f'bytes {start}-{end}/{size}')
-                          self.send_header('Content-Length', str(end - start + 1))
-                          self.send_header('Accept-Ranges', 'bytes')
-                          self.send_header('Connection', 'keep-alive')
-                          self.end_headers()
-                          self.wfile.flush()
-
-                          try:
-                              self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                          except Exception:
-                              pass
-
-                          to_send = end - start + 1
-                          sock_fd = self.connection.fileno()
-                          file_fd = f.fileno()
-                          offset = start
-                          chunk_size = 8 * 1024 * 1024
-                          while to_send > 0:
-                              batch = min(chunk_size, to_send)
-                              sent = os.sendfile(sock_fd, file_fd, offset, batch)
-                              if sent <= 0:
-                                  break
-                              offset += sent
-                              to_send -= sent
-
-                          try:
-                              with open('/tmp/last_transfer', 'w') as tf:
-                                  tf.write(str(time.time()))
-                          except Exception:
-                              pass
-
-                          f.close()
-                          return None
-                  except Exception:
-                      f.close()
-                  return super().send_head()
-
-          server = ThreadingHTTPServer(('0.0.0.0', 8080), functools.partial(RangeRequestHandler, directory=dl_path))
-          server.serve_forever()
-          " > /tmp/server.log 2>&1 &
-
-          cloudflared tunnel --url http://127.0.0.1:8080 > /tmp/tunnel.log 2>&1 &
-
-          # Pre-extract Cloudflare tunnel URL in background
-          (
-            for i in {1..30}; do
-              T_URL=$(grep -oE "https://[a-zA-Z0-9-]+\.trycloudflare\.com" /tmp/tunnel.log | head -n 1 || true)
-              if [ -n "$T_URL" ]; then
-                echo "$T_URL" > /tmp/tunnel_url.txt
-                break
-              fi
-              sleep 0.5
-            done
-          ) &
-
-          PUBLIC_TRACKERS="udp://tracker.opentrackr.org:1337/announce,udp://open.stealth.si:80/announce,udp://tracker.torrent.eu.org:451/announce,udp://open.demonii.com:1337/announce,udp://tracker.therarbg.to:6969/announce,udp://tracker.dler.org:6969/announce,udp://explodie.org:6969/announce,udp://zer0day.ch:1337/announce,udp://tracker.qu.ax:6969/announce,https://tracker.pmman.tech:443/announce,https://tracker.tamersunion.org:443/announce,https://tracker.nekobt.to/api/tracker/public/announce,http://nyaa.tracker.wf:7777/announce,https://tracker.nekomi.cn:443/announce,https://tracker.leechshield.link:443/announce,https://tracker.7471.top:443/announce,https://tracker.foreverpirates.co:443/announce"
-
-          ARIA2_OPTS=(
-            --dir="$DL_DIR"
-            --seed-time=0
-            --file-allocation=none
-            --event-poll=epoll
-            --bt-max-peers=500
-            --bt-request-peer-speed-limit=200M
-            --disk-cache=512M
-            --max-overall-upload-limit=50M
-            --bt-tracker-connect-timeout=5
-            --bt-tracker-timeout=5
-            --bt-tracker-interval=10
-            --bt-max-open-files=1000
-            --bt-enable-lpd=true
-            --peer-id-prefix="-qB4650-"
-            --dht-entry-point=router.bittorrent.com:6881
-            --dht-file-path=/home/runner/.cache/aria2/dht.dat
-            --dht-file-path6=/home/runner/.cache/aria2/dht6.dat
-            --dht-listen-port=6881-6999
-            --listen-port=6881-6999
-            --summary-interval=1
-            --enable-peer-exchange=true
-            --bt-tracker="$PUBLIC_TRACKERS"
-            --bt-save-metadata=true
-          )
-
-          TORRENT_URL="${{ inputs.torrent_url }}"
-          if [ -n "$TORRENT_URL" ]; then
-            echo "Pre-fetching .torrent file..."
-            curl -sL --max-time 5 -o "$DL_DIR/payload.torrent" "$TORRENT_URL" || true
-            if [ -s "$DL_DIR/payload.torrent" ]; then
-              echo "Direct .torrent download with tuned peer flags..."
-              aria2c "${ARIA2_OPTS[@]}" --bt-stop-timeout=25 "$DL_DIR/payload.torrent" || true
-            else
-              echo "Direct .torrent fetch failed or empty; downloading via URI..."
-              aria2c "${ARIA2_OPTS[@]}" --bt-stop-timeout=25 "$TORRENT_URL" || true
-            fi
+          TAG="${GITHUB_REF_NAME}"
+          if [[ -z "$TAG" || "$TAG" == "main" ]]; then
+            TAG="v1.0.0"
           fi
 
-          # If media file not yet obtained, fallback to magnet
-          MEDIA_COUNT=$(find "$DL_DIR" -maxdepth 2 -type f ! -name "*.torrent" ! -name "*.dat" ! -name "*.aria2" | wc -l)
-          if [ "$MEDIA_COUNT" -eq 0 ]; then
-            echo "Fallback to magnet URI with full tracker swarm..."
-            aria2c "${ARIA2_OPTS[@]}" --bt-stop-timeout=180 "${{ inputs.magnet }}" || true
-          fi
+          # Create the release if it doesn't exist yet
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "Torrentty $TAG" --generate-notes
 
-          echo "Downloaded files on disk:"
-          ls -lh "$DL_DIR"
-
-          # Clean up names and metadata files
-          rm -f *.torrent *.aria2
-          TARGET_FILE=""
-          for f in *; do
-            case "$f" in
-              *.torrent|*.aria2|*.dat) continue ;;
-            esac
-            if [ -f "$f" ]; then
-              clean_name="$(echo "$f" | sed 's/[][()]/_/g' | tr ' ' '_')"
-              if [ "$clean_name" != "$f" ]; then
-                mv "$f" "$clean_name"
-              fi
-              TARGET_FILE="$clean_name"
-              break
-            elif [ -d "$f" ]; then
-              clean_name="$(echo "$f" | sed 's/[][()]/_/g' | tr ' ' '_').tar"
-              tar -cf "$clean_name" "$f"
-              TARGET_FILE="$clean_name"
-              break
-            fi
-          done
-
-          TAG="${{ inputs.tag }}"
-          REPO="Aditya-233/Torrenty"
-
-          if [ -z "$TARGET_FILE" ]; then
-            echo "ERROR: Failed to download torrent payload. Swarm inactive or metadata resolution failed."
-            gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1 || gh release create "$TAG" --repo "$REPO" --title "Torrent Cloud Downloads" --notes "ERROR: Download failed. No swarm peers or metadata unavailable." || true
-            gh release edit "$TAG" --repo "$REPO" --notes "ERROR: Download failed. No swarm peers or metadata unavailable." 2>/dev/null || true
-            exit 1
-          fi
-
-          # Extract Cloudflare tunnel URL
-          TUNNEL_URL=""
-          if [ -s /tmp/tunnel_url.txt ]; then
-            TUNNEL_URL=$(cat /tmp/tunnel_url.txt | tr -d '[:space:]')
-          fi
-          if [ -z "$TUNNEL_URL" ]; then
-            for i in {1..10}; do
-              TUNNEL_URL=$(grep -oE "https://[a-zA-Z0-9-]+\.trycloudflare\.com" /tmp/tunnel.log | head -n 1 || true)
-              if [ -n "$TUNNEL_URL" ]; then
-                break
-              fi
-              sleep 0.5
-            done
-          fi
-          echo "Discovered Tunnel URL: $TUNNEL_URL"
-          if [ -z "$TUNNEL_URL" ]; then
-            echo "Tunnel log output:"
-            cat /tmp/tunnel.log || true
-          fi
-
-          if [ -n "$TUNNEL_URL" ] && [ -n "$TARGET_FILE" ]; then
-            STREAM_NOTE="STREAM_URL: $TUNNEL_URL/$TARGET_FILE"
-            echo "Instant Stream URL available: $STREAM_NOTE"
-            gh release edit "$TAG" --repo "$REPO" --notes "$STREAM_NOTE" 2>/dev/null || gh release create "$TAG" --repo "$REPO" --title "Torrent Cloud Downloads" --notes "$STREAM_NOTE" || true
-          else
-            echo "Tunnel URL not found, falling back to release upload..."
-            gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1 || gh release create "$TAG" --repo "$REPO" --title "Torrent Cloud Downloads" --notes "Release fallback" || true
-          fi
-
-          # Upload to GitHub Release as permanent backup while client streams via tunnel
-          UPLOAD_PID=""
-          if [ -n "$TARGET_FILE" ]; then
-            echo "Starting GitHub release backup upload in background..."
-            gh release upload "$TAG" "$TARGET_FILE" --repo "$REPO" --clobber &
-            UPLOAD_PID=$!
-          fi
-
-          echo "Holding stream tunnel active for client streaming..."
-          START_HOLD=$(date +%s)
-          UPLOAD_DONE=0
-          while true; do
-            NOW=$(date +%s)
-            ELAPSED=$((NOW - START_HOLD))
-
-            # 1. Hard safety ceiling: 25 minutes (1500 seconds)
-            if [ "$ELAPSED" -gt 1500 ]; then
-              echo "Max stream hold time reached (25m). Completing job."
-              break
-            fi
-
-            # 2. Check if background backup upload finished
-            if [ -n "$UPLOAD_PID" ]; then
-              if ! kill -0 $UPLOAD_PID 2>/dev/null; then
-                UPLOAD_DONE=1
-              fi
-            else
-              UPLOAD_DONE=1
-            fi
-
-            # 3. Check client streaming activity via /tmp/last_transfer
-            if [ -f /tmp/last_transfer ]; then
-              LAST_ACTIVE=$(stat -c %Y /tmp/last_transfer 2>/dev/null || echo "$NOW")
-              IDLE=$((NOW - LAST_ACTIVE))
-              if [ "$IDLE" -gt 75 ] && [ "$ELAPSED" -gt 120 ] && [ "$UPLOAD_DONE" -eq 1 ]; then
-                echo "Stream idle for ${IDLE}s after active transfer and backup upload complete. Completing job."
-                break
-              fi
-            else
-              if [ "$ELAPSED" -gt 300 ] && [ "$UPLOAD_DONE" -eq 1 ]; then
-                echo "No stream requests received within 5m. Completing job."
-                break
-              fi
-            fi
-
-            sleep 5
-          done
-
-          if [ -n "$UPLOAD_PID" ]; then
-            wait $UPLOAD_PID 2>/dev/null || true
-          fi
-          echo "Upload and stream session complete."
-
-      - name: Save DHT Routing Table
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: /home/runner/.cache/aria2
-          key: dht-cache-${{ github.run_id }}
+          # Upload or overwrite the asset
+          gh release upload "$TAG" "${{ matrix.asset_name }}" --clobber
