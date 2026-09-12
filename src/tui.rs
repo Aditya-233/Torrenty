@@ -822,6 +822,7 @@ impl DownloadSession {
         let mut down_speed_ema = 0.0;
         let mut up_speed_ema = 0.0;
         let mut stalled_ticks = 0;
+        let mut sent_success = false;
 
         loop {
             let (total, progress, uploaded, finished) = if let Some(ref handle) = handle_opt {
@@ -836,15 +837,17 @@ impl DownloadSession {
                 (torrent.size_bytes, 0, 0, false)
             };
 
-            if finished {
+            if finished && !sent_success {
                 let _ = download_tx.send((info_hash.clone(), DownloadEvent::Success));
-                break;
+                sent_success = true;
             }
 
-            if progress > 0 && progress > last_down_bytes {
+            if progress > 0 || finished {
                 stalled_ticks = 0;
                 let ratio_pct = if total > 0 {
                     ((progress as f64) / (total as f64)).clamp(0.0, 1.0)
+                } else if finished {
+                    1.0
                 } else {
                     0.0
                 };
