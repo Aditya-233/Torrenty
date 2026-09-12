@@ -5,79 +5,13 @@ use serde::Deserialize;
 use crate::types::Torrent;
 use crate::util::{parse_opt_string, parse_string, parse_u32, parse_u64};
 
-fn is_local_port_open(port: u16) -> bool {
-    std::net::TcpStream::connect_timeout(
-        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
-        std::time::Duration::from_millis(60),
-    )
-    .is_ok()
-}
-
 pub fn build_client() -> Result<Client> {
-    let mut builder = Client::builder()
+    Client::builder()
         .user_agent("Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0")
         .connect_timeout(std::time::Duration::from_secs(6))
-        .timeout(std::time::Duration::from_secs(10));
-
-    let mut proxy_str = None;
-
-    // Check SOCKS proxy environment variables first (remote DNS via socks5h)
-    for var in ["ALL_PROXY", "all_proxy", "SOCKS_PROXY", "socks_proxy"] {
-        if let Ok(val) = std::env::var(var) {
-            let val = val.trim();
-            if !val.is_empty() {
-                let formatted = if let Some(stripped) = val.strip_prefix("socks5://") {
-                    format!("socks5h://{stripped}")
-                } else {
-                    val.to_string()
-                };
-                crate::log_info!("Found SOCKS proxy env {}={}", var, formatted);
-                proxy_str = Some(formatted);
-                break;
-            }
-        }
-    }
-
-    // Check HTTP proxy environment variables
-    if proxy_str.is_none() {
-        for var in ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"] {
-            if let Ok(val) = std::env::var(var) {
-                let val = val.trim();
-                if !val.is_empty() {
-                    crate::log_info!("Found HTTP proxy env {}={}", var, val);
-                    proxy_str = Some(val.to_string());
-                    break;
-                }
-            }
-        }
-    }
-
-    // Fallback: auto-detect active local DPI bypass ports (1080 SOCKS5 preferred, 8080 HTTP fallback)
-    if proxy_str.is_none() {
-        if is_local_port_open(1080) {
-            crate::log_info!("Auto-detected active DPI bypass SOCKS5 engine on 127.0.0.1:1080");
-            proxy_str = Some("socks5h://127.0.0.1:1080".to_string());
-        } else if is_local_port_open(8080) {
-            crate::log_info!("Auto-detected active HTTP proxy on 127.0.0.1:8080");
-            proxy_str = Some("http://127.0.0.1:8080".to_string());
-        }
-    }
-
-    if let Some(ref p) = proxy_str {
-        match reqwest::Proxy::all(p) {
-            Ok(proxy) => {
-                builder = builder.proxy(proxy);
-                crate::log_info!("Configured reqwest HTTP client with proxy: {}", p);
-            }
-            Err(e) => {
-                crate::log_warn!("Failed to configure proxy '{}': {:#}", p, e);
-            }
-        }
-    } else {
-        crate::log_info!("No proxy configured for reqwest HTTP client (direct connection)");
-    }
-
-    builder.build().context("failed to build HTTP client")
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .context("failed to build HTTP client")
 }
 
 pub async fn search_piratebay(client: &Client, query: &str, limit: usize) -> Result<Vec<Torrent>> {

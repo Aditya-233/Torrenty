@@ -1,7 +1,6 @@
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -83,7 +82,6 @@ struct SearchTui {
     session: Arc<Session>,
     history_path: PathBuf,
     client: reqwest::Client,
-    dpi_blocked: Arc<AtomicBool>,
     should_quit: bool,
     show_help: bool,
     focus: FocusPane,
@@ -92,17 +90,6 @@ struct SearchTui {
     download_rx: tokio::sync::mpsc::UnboundedReceiver<(String, DownloadEvent)>,
     results_tx: tokio::sync::mpsc::UnboundedSender<Result<Vec<Torrent>>>,
     results_rx: tokio::sync::mpsc::UnboundedReceiver<Result<Vec<Torrent>>>,
-}
-
-struct CloudAccelerationParams<'a> {
-    pub client: &'a reqwest::Client,
-    pub info_hash: &'a str,
-    pub torrent_name: &'a str,
-    pub magnet: &'a str,
-    pub torrent_url: Option<String>,
-    pub target_path: PathBuf,
-    pub total_size: u64,
-    pub download_tx: &'a tokio::sync::mpsc::UnboundedSender<(String, DownloadEvent)>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -124,12 +111,6 @@ impl SearchTui {
         let (download_tx, download_rx) = tokio::sync::mpsc::unbounded_channel();
         let (results_tx, results_rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let dpi_blocked = Arc::new(AtomicBool::new(true));
-        let dpi_clone = dpi_blocked.clone();
-        tokio::spawn(async move {
-            Self::run_canary_probe(dpi_clone).await;
-        });
-
         Self {
             query_input: String::new(),
             results: Vec::new(),
@@ -139,7 +120,6 @@ impl SearchTui {
             session,
             history_path,
             client,
-            dpi_blocked,
             should_quit: false,
             show_help: false,
             focus: FocusPane::Results,
@@ -149,40 +129,6 @@ impl SearchTui {
             results_tx,
             results_rx,
         }
-    }
-
-    async fn run_canary_probe(dpi_blocked: Arc<AtomicBool>) {
-        let is_blocked = tokio::task::spawn_blocking(|| {
-            use std::net::{TcpStream, ToSocketAddrs};
-            use std::io::{Read, Write};
-
-            let addrs = match "tracker.opentrackr.org:1337".to_socket_addrs() {
-                Ok(a) => a.collect::<Vec<_>>(),
-                Err(_) => return true,
-            };
-            if addrs.is_empty() {
-                return true;
-            }
-
-            let socket = match TcpStream::connect_timeout(&addrs[0], Duration::from_millis(1500)) {
-                Ok(s) => s,
-                Err(_) => return true,
-            };
-
-            let _ = socket.set_read_timeout(Some(Duration::from_millis(1500)));
-            let _ = socket.set_write_timeout(Some(Duration::from_millis(1500)));
-
-            let handshake = b"\x13BitTorrent protocol\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
-            let mut stream = socket;
-            if stream.write_all(handshake).is_err() {
-                return true;
-            }
-
-            let mut buf = [0u8; 68];
-            !matches!(stream.read(&mut buf), Ok(n) if n > 0)
-        }).await.unwrap_or(true);
-
-        dpi_blocked.store(is_blocked, Ordering::Relaxed);
     }
 
     async fn run(&mut self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
@@ -609,7 +555,6 @@ impl SearchTui {
                         self.session.clone(),
                         self.download_tx.clone(),
                         self.client.clone(),
-                        self.dpi_blocked.clone(),
                     );
                     self.downloads.push(download);
                     self.selected_download = self.downloads.len().saturating_sub(1);
@@ -784,74 +729,25 @@ impl DownloadSession {
         session: Arc<Session>,
         download_tx: tokio::sync::mpsc::UnboundedSender<(String, DownloadEvent)>,
         client: reqwest::Client,
-        dpi_blocked: Arc<AtomicBool>,
     ) -> Self {
         let target_path = crate::storage::default_download_dir().join(&torrent.name);
-        let is_dpi_blocked = dpi_blocked.load(Ordering::Relaxed);
+        let torrent_clone = torrent.clone();
+        tokio::runtime::Handle::current().spawn(Self::download_task(
+            session,
+            torrent_clone,
+            download_tx,
+            client,
+        ));
 
-        if is_dpi_blocked {
-            let client_c = client.clone();
-            let info_hash_c = torrent.info_hash.clone();
-            let name_c = torrent.name.clone();
-            let magnet_c = torrent.resolved_magnet();
-            let torrent_url_c = torrent.torrent_url.clone();
-            let target_path_c = target_path.clone();
-            let download_tx_c = download_tx.clone();
-            let total_size = torrent.size_bytes;
-
-            tokio::spawn(async move {
-                let _ = download_tx_c.send((
-                    info_hash_c.clone(),
-                    DownloadEvent::Status(
-                        "Canary: DPI firewall detected. Bypassing local swarm (0s delay)..."
-                            .to_string(),
-                    ),
-                ));
-                let params = CloudAccelerationParams {
-                    client: &client_c,
-                    info_hash: &info_hash_c,
-                    torrent_name: &name_c,
-                    magnet: &magnet_c,
-                    torrent_url: torrent_url_c,
-                    target_path: target_path_c,
-                    total_size,
-                    download_tx: &download_tx_c,
-                };
-                if let Err(e) = Self::run_cloud_acceleration(params).await {
-                    let _ = download_tx_c.send((info_hash_c, DownloadEvent::Error(format!("{e}"))));
-                }
-            });
-
-            Self {
-                target_path,
-                torrent,
-                tracking: DownloadTracking::Managed,
-                progress: None,
-                status_text: "Canary: DPI detected. Activating Cloud Accelerator (0s delay)..."
-                    .to_string(),
-                started_at: Instant::now(),
-                finished_duration: None,
-                outcome: None,
-            }
-        } else {
-            let torrent_clone = torrent.clone();
-            tokio::runtime::Handle::current().spawn(Self::download_task(
-                session,
-                torrent_clone,
-                download_tx,
-                client,
-            ));
-
-            Self {
-                target_path,
-                torrent,
-                tracking: DownloadTracking::Managed,
-                progress: None,
-                status_text: "Connecting to swarm...".to_string(),
-                started_at: Instant::now(),
-                finished_duration: None,
-                outcome: None,
-            }
+        Self {
+            target_path,
+            torrent,
+            tracking: DownloadTracking::Managed,
+            progress: None,
+            status_text: "Connecting to swarm...".to_string(),
+            started_at: Instant::now(),
+            finished_duration: None,
+            outcome: None,
         }
     }
 
@@ -909,7 +805,10 @@ impl DownloadSession {
 
         let handle_opt = match session.add_torrent(add_request, Some(add_opts)).await {
             Ok(response) => response.into_handle(),
-            Err(_) => None,
+            Err(e) => {
+                let _ = download_tx.send((info_hash.clone(), DownloadEvent::Error(format!("{e}"))));
+                None
+            }
         };
 
         let _ = download_tx.send((
@@ -995,470 +894,16 @@ impl DownloadSession {
                 }
             } else {
                 stalled_ticks += 1;
-                // If local peer download makes 0 progress after 6 seconds, firewall DPI is blocking peer handshakes.
-                // Automatically activate the cloud accelerator.
-                if stalled_ticks >= 6 {
-                    let client_c = client.clone();
-                    let info_hash_c = info_hash.clone();
-                    let name_c = torrent.name.clone();
-                    let magnet_c = torrent.resolved_magnet();
-                    let torrent_url_c = torrent.torrent_url.clone();
-                    let target_path = crate::storage::default_download_dir().join(&torrent.name);
-                    let download_tx_c = download_tx.clone();
-                    let total_size = torrent.size_bytes;
-
-                    tokio::spawn(async move {
-                        let params = CloudAccelerationParams {
-                            client: &client_c,
-                            info_hash: &info_hash_c,
-                            torrent_name: &name_c,
-                            magnet: &magnet_c,
-                            torrent_url: torrent_url_c,
-                            target_path,
-                            total_size,
-                            download_tx: &download_tx_c,
-                        };
-                        if let Err(e) = Self::run_cloud_acceleration(params).await {
-                            let _ = download_tx_c
-                                .send((info_hash_c, DownloadEvent::Error(format!("{e}"))));
-                        }
-                    });
-                    break;
+                if stalled_ticks % 10 == 0 && progress == 0 {
+                    let _ = download_tx.send((
+                        info_hash.clone(),
+                        DownloadEvent::Status("Searching for peers in swarm...".to_string()),
+                    ));
                 }
             }
 
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
-    }
-
-    async fn run_cloud_acceleration(params: CloudAccelerationParams<'_>) -> Result<()> {
-        let CloudAccelerationParams {
-            client,
-            info_hash,
-            torrent_name,
-            magnet,
-            torrent_url,
-            target_path,
-            total_size,
-            download_tx,
-        } = params;
-        let tag = format!(
-            "dl_{}_{}",
-            &info_hash[..8.min(info_hash.len())],
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs()
-        );
-        let info_hash_str = info_hash.to_string();
-
-        let _ = download_tx.send((
-            info_hash_str.clone(),
-            DownloadEvent::Status("DPI detected. Activating Cloud Accelerator...".to_string()),
-        ));
-
-        let mut download_url = None;
-        let mut backup_asset_url = None;
-        let mut expected_size = total_size;
-
-        // Dispatch cloud workflow for a fresh accelerated download
-        let _ = download_tx.send((
-            info_hash_str.clone(),
-            DownloadEvent::Status("Dispatching cloud runner (10 Gbps)...".to_string()),
-        ));
-        let trigger = tokio::task::spawn_blocking({
-            let magnet_c = magnet.to_string();
-            let name_c = torrent_name.to_string();
-            let tag_c = tag.clone();
-            let torrent_url_c = torrent_url;
-            move || {
-                let mut args = vec![
-                    "workflow".to_string(),
-                    "run".to_string(),
-                    "cloud_download.yml".to_string(),
-                    "--repo".to_string(),
-                    "Aditya-233/Torrenty".to_string(),
-                    "-f".to_string(),
-                    format!("magnet={}", magnet_c),
-                    "-f".to_string(),
-                    format!("name={}", name_c),
-                    "-f".to_string(),
-                    format!("tag={}", tag_c),
-                ];
-                if let Some(ref turl) = torrent_url_c {
-                    args.push("-f".to_string());
-                    args.push(format!("torrent_url={}", turl));
-                }
-                std::process::Command::new("gh").args(&args).output()
-            }
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))??;
-
-        if !trigger.status.success() {
-            return Err(anyhow::anyhow!(
-                "Failed to dispatch GitHub cloud workflow: {}",
-                String::from_utf8_lossy(&trigger.stderr)
-            ));
-        }
-
-        // Poll every 500ms for up to 6 minutes for sub-second stream URL discovery
-        let start = Instant::now();
-        while start.elapsed() < Duration::from_secs(360) {
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            let elapsed_sec = start.elapsed().as_secs();
-            let _ = download_tx.send((
-                info_hash_str.clone(),
-                DownloadEvent::Status(format!("Cloud downloading swarm ({}s)...", elapsed_sec)),
-            ));
-
-            let poll_res = tokio::task::spawn_blocking({
-                let tag_c = tag.clone();
-                move || {
-                    std::process::Command::new("gh")
-                        .args([
-                            "release",
-                            "view",
-                            &tag_c,
-                            "--repo",
-                            "Aditya-233/Torrenty",
-                            "--json",
-                            "assets,body",
-                        ])
-                        .output()
-                }
-            })
-            .await
-            .ok()
-            .and_then(|r| r.ok());
-
-            if let Some(out) = poll_res.filter(|o| o.status.success())
-                && let Ok(json_val) = serde_json::from_slice::<serde_json::Value>(&out.stdout)
-            {
-                if let Some(body) = json_val.get("body").and_then(|b| b.as_str()) {
-                    for line in body.lines() {
-                        if let Some(rest) = line.strip_prefix("STREAM_URL:") {
-                            let u = rest.trim();
-                            if u.starts_with("https://") {
-                                download_url = Some(u.to_string());
-                                break;
-                            }
-                        } else if let Some(rest) = line.strip_prefix("ERROR:") {
-                            return Err(anyhow::anyhow!(
-                                "Cloud accelerator failed: {}",
-                                rest.trim()
-                            ));
-                        }
-                    }
-                }
-
-                if let Some(assets) = json_val.get("assets").and_then(|a| a.as_array()) {
-                    for asset in assets {
-                        let sz = asset.get("size").and_then(|s| s.as_u64()).unwrap_or(0);
-                        if sz > 1024
-                            && let Some(url) = asset.get("url").and_then(|u| u.as_str())
-                        {
-                            backup_asset_url = Some(url.to_string());
-                            expected_size = sz;
-                            break;
-                        }
-                    }
-                }
-            }
-
-            if download_url.is_some() {
-                break;
-            }
-        }
-
-        let Some(url) = download_url.or_else(|| backup_asset_url.clone()) else {
-            return Err(anyhow::anyhow!(
-                "Cloud download timed out waiting for release asset"
-            ));
-        };
-
-        // Deterministic backup asset URL from GitHub Release
-        let backup_url = backup_asset_url.or_else(|| {
-            let filename = url.rsplit('/').next().unwrap_or("");
-            if !filename.is_empty() {
-                Some(format!(
-                    "https://github.com/Aditya-233/Torrenty/releases/download/{tag}/{filename}"
-                ))
-            } else {
-                None
-            }
-        });
-
-        let _ = download_tx.send((
-            info_hash_str.clone(),
-            DownloadEvent::Status("Streaming verified data over HTTPS...".to_string()),
-        ));
-
-        // Create dedicated streaming client bypassing local SOCKS proxies with TCP_NODELAY, independent HTTP/1.1 connections, and connection pooling
-        let streaming_client = reqwest::Client::builder()
-            .no_proxy()
-            .http1_only()
-            .tcp_nodelay(true)
-            .pool_max_idle_per_host(64)
-            .build()
-            .unwrap_or_else(|_| client.clone());
-
-        let probe_resp = streaming_client
-            .get(&url)
-            .timeout(Duration::from_secs(15))
-            .header("Range", "bytes=0-0")
-            .send()
-            .await
-            .ok();
-        let (supports_range, total_bytes) = if let Some(ref r) = probe_resp {
-            if r.status() == reqwest::StatusCode::PARTIAL_CONTENT {
-                let sz = r
-                    .headers()
-                    .get("Content-Range")
-                    .and_then(|h| h.to_str().ok())
-                    .and_then(|s| s.split('/').next_back())
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(expected_size);
-                (true, sz)
-            } else {
-                (false, r.content_length().unwrap_or(expected_size))
-            }
-        } else {
-            (false, expected_size)
-        };
-
-        let file = std::fs::File::create(&target_path)?;
-        if total_bytes > 0 {
-            let _ = file.set_len(total_bytes);
-        }
-        drop(file);
-
-        let num_workers: usize = if supports_range && total_bytes > 500_000_000 {
-            24
-        } else if supports_range && total_bytes > 10_000_000 {
-            16
-        } else {
-            1
-        };
-        let chunk_size = total_bytes.div_ceil(num_workers as u64);
-        let downloaded = Arc::new(std::sync::atomic::AtomicU64::new(0));
-
-        let progress_task = {
-            let downloaded = downloaded.clone();
-            let info_hash_str = info_hash_str.clone();
-            let download_tx = download_tx.clone();
-            tokio::spawn(async move {
-                let mut last_tick = Instant::now();
-                let mut last_bytes = 0;
-                loop {
-                    tokio::time::sleep(Duration::from_millis(250)).await;
-                    let current = downloaded.load(Ordering::Relaxed);
-                    let now = Instant::now();
-                    let dt = now.duration_since(last_tick).as_secs_f64();
-                    let speed = if dt > 0.0 {
-                        ((current.saturating_sub(last_bytes)) as f64 / dt) as u64
-                    } else {
-                        0
-                    };
-                    let ratio = if total_bytes > 0 {
-                        (current as f64 / total_bytes as f64).clamp(0.0, 1.0)
-                    } else {
-                        0.0
-                    };
-                    let is_done = total_bytes > 0 && current >= total_bytes;
-                    let _ = download_tx.send((
-                        info_hash_str.clone(),
-                        DownloadEvent::Progress {
-                            ratio,
-                            down_speed: speed,
-                            up_speed: 0,
-                            share_ratio: 0.0,
-                            progress_bytes: current,
-                            finished: is_done,
-                        },
-                    ));
-                    last_tick = now;
-                    last_bytes = current;
-                    if is_done {
-                        break;
-                    }
-                }
-            })
-        };
-
-        if num_workers > 1 {
-            let mut handles = Vec::new();
-            for i in 0..num_workers {
-                let start = i as u64 * chunk_size;
-                let end = ((i as u64 + 1) * chunk_size - 1).min(total_bytes - 1);
-                if start > end {
-                    continue;
-                }
-                let client = streaming_client.clone();
-                let primary_url = url.clone();
-                let backup_url = backup_url.clone();
-                let target_path = target_path.clone();
-                let downloaded = downloaded.clone();
-
-                handles.push(tokio::spawn(async move {
-                    let file = std::fs::OpenOptions::new().write(true).open(&target_path)?;
-                    let mut current_offset = start;
-                    let mut attempts = 0;
-                    let mut use_backup = false;
-
-                    while current_offset <= end && attempts < 25 {
-                        attempts += 1;
-                        let active_url = if use_backup {
-                            backup_url.as_deref().unwrap_or(&primary_url)
-                        } else {
-                            &primary_url
-                        };
-
-                        let range_header = format!("bytes={}-{}", current_offset, end);
-                        let req = client
-                            .get(active_url)
-                            .timeout(Duration::from_secs(600))
-                            .header("Range", &range_header)
-                            .send()
-                            .await;
-
-                        match req {
-                            Ok(resp)
-                                if resp.status().is_success()
-                                    || resp.status() == reqwest::StatusCode::PARTIAL_CONTENT =>
-                            {
-                                let mut stream = resp;
-                                while let Ok(Some(chunk)) = stream.chunk().await {
-                                    #[cfg(unix)]
-                                    {
-                                        use std::os::unix::fs::FileExt;
-                                        if let Err(e) = file.write_all_at(&chunk, current_offset) {
-                                            return Err(anyhow::anyhow!("Write error: {e}"));
-                                        }
-                                    }
-                                    current_offset += chunk.len() as u64;
-                                    downloaded.fetch_add(chunk.len() as u64, Ordering::Relaxed);
-                                    attempts = 0;
-                                }
-                                if current_offset > end {
-                                    return Ok(());
-                                }
-                            }
-                            Ok(resp) => {
-                                crate::log_warn!(
-                                    "Worker [{start}-{end}] status {}: failover to backup asset",
-                                    resp.status()
-                                );
-                                if backup_url.is_some() {
-                                    use_backup = true;
-                                }
-                            }
-                            Err(e) => {
-                                crate::log_warn!(
-                                    "Worker [{start}-{end}] error (attempt {attempts}/25): {e}"
-                                );
-                                if backup_url.is_some() {
-                                    use_backup = true;
-                                }
-                            }
-                        }
-                        tokio::time::sleep(Duration::from_millis(500 * attempts.min(6))).await;
-                    }
-
-                    if current_offset <= end {
-                        return Err(anyhow::anyhow!(
-                            "Worker failed slice {start}-{end} (offset {current_offset}/{end})"
-                        ));
-                    }
-                    Ok::<(), anyhow::Error>(())
-                }));
-            }
-
-            for handle in handles {
-                handle.await??;
-            }
-        } else {
-            let file = std::fs::OpenOptions::new().write(true).open(&target_path)?;
-            let mut current_offset = 0;
-            let mut attempts = 0;
-            let mut use_backup = false;
-            let client = streaming_client.clone();
-
-            while current_offset < total_bytes && attempts < 25 {
-                attempts += 1;
-                let active_url = if use_backup {
-                    backup_url.as_deref().unwrap_or(&url)
-                } else {
-                    &url
-                };
-
-                let req = if supports_range && total_bytes > 0 {
-                    client
-                        .get(active_url)
-                        .timeout(Duration::from_secs(600))
-                        .header(
-                            "Range",
-                            format!("bytes={}-{}", current_offset, total_bytes - 1),
-                        )
-                } else {
-                    client.get(active_url).timeout(Duration::from_secs(600))
-                };
-
-                match req.send().await {
-                    Ok(resp)
-                        if resp.status().is_success()
-                            || resp.status() == reqwest::StatusCode::PARTIAL_CONTENT =>
-                    {
-                        let mut stream = resp;
-                        while let Ok(Some(chunk)) = stream.chunk().await {
-                            #[cfg(unix)]
-                            {
-                                use std::os::unix::fs::FileExt;
-                                if let Err(e) = file.write_all_at(&chunk, current_offset) {
-                                    return Err(anyhow::anyhow!("Write error: {e}"));
-                                }
-                            }
-                            current_offset += chunk.len() as u64;
-                            downloaded.fetch_add(chunk.len() as u64, Ordering::Relaxed);
-                            attempts = 0;
-                        }
-                        if current_offset >= total_bytes {
-                            break;
-                        }
-                    }
-                    Ok(_) | Err(_) => {
-                        if backup_url.is_some() {
-                            use_backup = true;
-                        }
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(500 * attempts.min(6))).await;
-            }
-
-            if current_offset < total_bytes {
-                return Err(anyhow::anyhow!(
-                    "Single-worker failed to complete download (stopped at {current_offset}/{total_bytes})"
-                ));
-            }
-        }
-
-        let _ = progress_task.await;
-
-        let final_downloaded = downloaded.load(Ordering::Relaxed);
-        let _ = download_tx.send((
-            info_hash_str.clone(),
-            DownloadEvent::Progress {
-                ratio: 1.0,
-                down_speed: 0,
-                up_speed: 0,
-                share_ratio: 0.0,
-                progress_bytes: final_downloaded,
-                finished: true,
-            },
-        ));
-        let _ = download_tx.send((info_hash_str, DownloadEvent::Success));
-
-        Ok(())
     }
 
     #[allow(dead_code)]

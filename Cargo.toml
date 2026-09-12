@@ -3,28 +3,24 @@ name = "torrentty"
 version = "1.0.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-description = "Ultra-fast terminal BitTorrent client with asymmetric cloud swarm acceleration"
+description = "Ultra-fast, lightweight keyboard-driven terminal BitTorrent search & download client"
 repository = "https://github.com/Aditya-233/Torrenty"
 homepage = "https://github.com/Aditya-233/Torrenty"
 readme = "README.md"
 authors = ["Aditya <https://github.com/Aditya-233>"]
-keywords = ["torrent", "bittorrent", "tui", "ratatui", "accelerator"]
+keywords = ["torrent", "bittorrent", "tui", "ratatui", "client"]
 categories = ["command-line-utilities", "network-programming"]
 
 [dependencies]
-anyhow = "1.0"
-crossterm = "0.29"
-ratatui = "0.30"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-tokio = { version = "1.52", features = ["macros", "rt-multi-thread", "time"] }
+anyhow = "1.0.104"
+crossterm = "0.29.0"
 librqbit = { version = "8.1.1", default-features = false, features = ["default-tls"] }
-reqwest = { version = "0.12", default-features = false, features = ["gzip", "default-tls", "socks"] }
-url = "2.5"
-
-[dev-dependencies]
-tracing = "0.1"
-tracing-subscriber = "0.3"
+ratatui = "0.30.2"
+reqwest = { version = "0.12.28", default-features = false, features = ["gzip", "default-tls"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "time"] }
+url = "2.5.8"
 
 [profile.release]
 opt-level = "s"
@@ -32,3 +28,4 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
